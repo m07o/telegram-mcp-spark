@@ -1,0 +1,19 @@
+{
+  "name": "spark-telegram-agent",
+  "version": "1.0.0",
+  "description": "Intelligent Telegram Agent for Spark with Dynamic MCP Server Management and Gemini Agentic Loop",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "build:test": "esbuild tests/agent.test.mjs --bundle --platform=node --format=esm --outfile=dist/test.mjs",
+    "test": "npm run build:test && node dist/test.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250224.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^3.109.2"
+  }
+}

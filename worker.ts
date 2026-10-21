@@ -80,8 +80,8 @@ class TelegramCloudflareWebSockets extends PromisedWebSockets {
   }
 }
 
-// Timeout helper using Promise.race to guarantee the Worker never hangs
-const MAX_TIMEOUT_MS = 25000;
+// Timeout helper using Promise.race to guarantee the Worker never hangs (increased to 120s for bulk topics and media)
+const MAX_TIMEOUT_MS = 120000;
 
 async function runWithTimeout<T>(
   promise: Promise<T>,
@@ -317,10 +317,10 @@ async function getTelegramClient(env: Env): Promise<TelegramClient> {
         floodSleepThreshold: 0, // Disable automatic sleeping on FloodWait to prevent worker timeouts
       });
 
-      // Wrap connect in timeout (20s) to allow WebSocket handshake and authentication
+      // Wrap connect in timeout (30s) to allow WebSocket handshake and authentication
       await runWithTimeout(
         client.connect(),
-        20000,
+        30000,
         `MTProto connect to ${gatewayDomain} (DC ${dcId})`
       );
 
@@ -357,8 +357,9 @@ export default {
         JSON.stringify({
           status: "ok",
           server: "telegram-userbot-mcp",
-          version: "2.0.0",
+          version: "2.1.0",
           totalTools: UNIQUE_TOOLS.length,
+          maxTimeoutMs: MAX_TIMEOUT_MS,
           protocol: "MTProto via Telegram Web Gateway (WSS)",
           activeSseSessions: sseSessions.size,
           clientConnected: Boolean(cachedClient?.connected),
@@ -376,7 +377,6 @@ export default {
     }
 
     // 3. Probing requests (HEAD on any supported endpoint for Google Gemini verification)
-    // Prevents 405 Method Not Allowed and passes content-type verification immediately
     if (request.method === "HEAD" && handledPaths.includes(url.pathname)) {
       return new Response(null, {
         status: 200,
@@ -558,7 +558,7 @@ async function handleJsonRpc(
             },
             serverInfo: {
               name: "telegram-userbot-mcp",
-              version: "2.0.0",
+              version: "2.1.0",
             },
           },
         };

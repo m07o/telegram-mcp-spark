@@ -9,4 +9,13 @@
   "observability": {
     "enabled": true
   }
+  // To enable permanent persistent storage across Worker restarts:
+  // 1. Create a KV namespace: npx wrangler kv namespace create TELEGRAM_KV
+  // 2. Add the binding below with your namespace ID:
+  // "kv_namespaces": [
+  //   {
+  //     "binding": "TELEGRAM_KV",
+  //     "id": "<YOUR_KV_NAMESPACE_ID>"
+  //   }
+  // ]
 }

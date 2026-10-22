@@ -1,7 +1,8 @@
 import { Api, TelegramClient } from "telegram";
 
 /**
- * Resolves any peer (User, Chat, Channel, "me") with automatic dialog cache warm-up.
+ * Resolves any peer (User, Chat, Channel, "me") using cached dialogs first,
+ * guaranteeing accurate channelId and accessHash resolution.
  */
 async function resolvePeer(client: TelegramClient, peer: string | number): Promise<any> {
   const str = String(peer).trim();
@@ -9,36 +10,27 @@ async function resolvePeer(client: TelegramClient, peer: string | number): Promi
     return await client.getInputEntity("me");
   }
 
+  const bare = str.replace(/^-100/, "").replace(/^-/, "");
+  try {
+    const dialogs = await client.getDialogs({ limit: 100 });
+    for (const d of dialogs) {
+      const dStr = String(d.id || "");
+      const dBare = dStr.replace(/^-100/, "").replace(/^-/, "");
+      const title = (d.title || d.name || "").trim().toLowerCase();
+
+      if (dStr === str || dBare === bare || title === str.toLowerCase()) {
+        if (d.inputEntity) return d.inputEntity;
+        if (d.entity) return await client.getInputEntity(d.entity);
+      }
+    }
+  } catch {}
+
   let target: any = peer;
   if (/^-?\d+$/.test(str)) {
     target = Number(str);
   }
-
-  try {
-    const ent = await client.getEntity(target);
-    return await client.getInputEntity(ent);
-  } catch (err) {
-    // Warm up entity cache with recent dialogs
-    try {
-      await client.getDialogs({ limit: 100 });
-      const ent = await client.getEntity(target);
-      return await client.getInputEntity(ent);
-    } catch {
-      if (str.startsWith("-100")) {
-        const bare = Number(str.replace(/^-100/, ""));
-        try {
-          const ent = await client.getEntity(bare);
-          return await client.getInputEntity(ent);
-        } catch {}
-      } else if (/^\d+$/.test(str)) {
-        try {
-          const ent = await client.getEntity(Number(`-100${str}`));
-          return await client.getInputEntity(ent);
-        } catch {}
-      }
-      throw err;
-    }
-  }
+  const ent = await client.getEntity(target);
+  return await client.getInputEntity(ent);
 }
 
 /**
@@ -46,47 +38,44 @@ async function resolvePeer(client: TelegramClient, peer: string | number): Promi
  */
 async function resolveChannel(client: TelegramClient, chatId: string | number): Promise<any> {
   const str = String(chatId).trim();
+  const bare = str.replace(/^-100/, "").replace(/^-/, "");
+
+  try {
+    const dialogs = await client.getDialogs({ limit: 100 });
+    for (const d of dialogs) {
+      const dStr = String(d.id || "");
+      const dBare = dStr.replace(/^-100/, "").replace(/^-/, "");
+      const title = (d.title || d.name || "").trim().toLowerCase();
+
+      if (dStr === str || dBare === bare || title === str.toLowerCase()) {
+        if (d.inputEntity && (d.inputEntity.className === "InputPeerChannel" || d.inputEntity.className === "InputChannel")) {
+          return new Api.InputChannel({
+            channelId: d.inputEntity.channelId,
+            accessHash: d.inputEntity.accessHash,
+          });
+        }
+        if (d.entity && (d.entity.className === "Channel" || (d.entity as any).megagroup || (d.entity as any).broadcast)) {
+          return new Api.InputChannel({
+            channelId: d.entity.id,
+            accessHash: (d.entity as any).accessHash || (BigInt(0) as any),
+          });
+        }
+      }
+    }
+  } catch {}
+
   let target: any = chatId;
   if (/^-?\d+$/.test(str)) {
     target = Number(str);
   }
-
-  let entity: any = null;
-  try {
-    entity = await client.getEntity(target);
-  } catch (err) {
-    try {
-      await client.getDialogs({ limit: 100 });
-      entity = await client.getEntity(target);
-    } catch {
-      if (str.startsWith("-100")) {
-        const bare = Number(str.replace(/^-100/, ""));
-        try {
-          entity = await client.getEntity(bare);
-        } catch {
-          throw err;
-        }
-      } else if (/^\d+$/.test(str)) {
-        try {
-          entity = await client.getEntity(Number(`-100${str}`));
-        } catch {
-          throw err;
-        }
-      } else {
-        throw err;
-      }
-    }
+  const entity: any = await client.getEntity(target);
+  if (!entity || (!entity.broadcast && !entity.megagroup && entity.className !== "Channel")) {
+    throw new Error(`Resolved entity for ${chatId} (${entity?.className}) is not a valid Channel/Supergroup.`);
   }
-
-  if (!entity) {
-    throw new Error(`Could not resolve entity for chat ${chatId}. Ensure the userbot is a member.`);
-  }
-
-  if (!entity.broadcast && !entity.megagroup && entity.className !== "Channel") {
-    throw new Error(`Resolved entity for ${chatId} (${entity.className}) is not a valid Channel/Supergroup.`);
-  }
-
-  return await client.getInputEntity(entity);
+  return new Api.InputChannel({
+    channelId: entity.id,
+    accessHash: entity.accessHash || (BigInt(0) as any),
+  });
 }
 
 export async function dispatchUserbotTool(

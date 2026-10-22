@@ -1,6 +1,6 @@
 {
   "name": "telegram-userbot-mcp",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Telegram Userbot MCP Server for Cloudflare Workers compatible with Google Gemini",
   "main": "worker.ts",
   "type": "module",

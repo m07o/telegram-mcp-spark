@@ -11,11 +11,13 @@ import { ConnectionTCPObfuscated } from "telegram/network";
 import { PromisedWebSockets } from "telegram/extensions";
 import { MCP_TOOLS, McpToolDefinition } from "./tools_registry";
 import { dispatchUserbotTool } from "./tool_dispatcher";
+import { setKvNamespace } from "./dispatcher_helpers";
 
 export interface Env {
   TELEGRAM_API_ID: string;
   TELEGRAM_API_HASH: string;
   TELEGRAM_SESSION_STRING: string;
+  TELEGRAM_KV?: any;
 }
 
 interface SseSession {
@@ -354,6 +356,11 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
+    // Pass optional Cloudflare KV namespace to helper storage layer
+    if (env.TELEGRAM_KV) {
+      setKvNamespace(env.TELEGRAM_KV);
+    }
+
     // 1. CORS Preflight (OPTIONS) -> Always 204 No Content
     if (request.method === "OPTIONS") {
       return new Response(null, {
@@ -370,16 +377,21 @@ export default {
         JSON.stringify({
           status: "ok",
           server: "telegram-userbot-mcp",
-          version: "3.1.0",
+          version: "3.2.0",
           totalTools: UNIQUE_TOOLS.length,
           maxTimeoutMs: MAX_TIMEOUT_MS,
           protocol: "MTProto via Telegram Web Gateway (WSS)",
           activeSseSessions: sseSessions.size,
           clientConnected: Boolean(cachedClient?.connected),
+          persistence: {
+            kv_storage_bound: Boolean(env.TELEGRAM_KV),
+            storage_mode: env.TELEGRAM_KV ? "Cloudflare KV + In-Memory Cache" : "In-Memory Only",
+          },
           configured: {
             apiId: Boolean(env.TELEGRAM_API_ID),
             apiHash: Boolean(env.TELEGRAM_API_HASH),
             sessionString: Boolean(env.TELEGRAM_SESSION_STRING),
+            kv: Boolean(env.TELEGRAM_KV),
           },
         }),
         {
@@ -403,265 +415,4 @@ export default {
       let intervalId: ReturnType<typeof setInterval> | null = null;
       let isCleanedUp = false;
 
-      const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          // Flush 2KB comment (: 2048 spaces\n\n) to immediately bypass Edge/Proxy buffering
-          controller.enqueue(encoder.encode(`: ${" ".repeat(2048)}\n\n`));
-
-          // Immediately transmit endpoint event with full URL including generated sessionId
-          const endpointUrl = `${url.origin}/messages?sessionId=${sessionId}`;
-          controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpointUrl}\n\n`));
-
-          const cleanup = () => {
-            if (isCleanedUp) return;
-            isCleanedUp = true;
-            if (intervalId !== null) {
-              clearInterval(intervalId);
-              intervalId = null;
-            }
-            sseSessions.delete(sessionId);
-            try {
-              controller.close();
-            } catch {
-              // Stream already closed or cancelled
-            }
-          };
-
-          // Register session
-          sseSessions.set(sessionId, {
-            controller,
-            close: cleanup,
-          });
-
-          // Periodic Keep-Alive heartbeat every 5 seconds (: keep-alive\n\n)
-          intervalId = setInterval(() => {
-            try {
-              controller.enqueue(encoder.encode(": keep-alive\n\n"));
-            } catch {
-              cleanup();
-            }
-          }, 5000);
-        },
-        cancel() {
-          const session = sseSessions.get(sessionId);
-          if (session) {
-            session.close();
-          }
-        },
-      });
-
-      // Handle client disconnect / abort signal
-      request.signal.addEventListener("abort", () => {
-        const session = sseSessions.get(sessionId);
-        if (session) {
-          session.close();
-        }
-      });
-
-      return new Response(stream, {
-        status: 200,
-        headers: SSE_HEADERS,
-      });
-    }
-
-    // 5. JSON-RPC 2.0 Handler (POST on /, /messages, /sse, or /mcp)
-    if (request.method === "POST" && handledPaths.includes(url.pathname)) {
-      const sessionId =
-        url.searchParams.get("sessionId") ||
-        url.searchParams.get("session_id") ||
-        request.headers.get("x-session-id") ||
-        request.headers.get("mcp-session-id") ||
-        undefined;
-
-      let body: any;
-      try {
-        body = await request.json();
-      } catch {
-        return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32700, message: "Parse error: Invalid JSON payload" },
-          }),
-          {
-            status: 400,
-            headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-          }
-        );
-      }
-
-      const responsePayload = await handleJsonRpc(body, env);
-
-      // JSON-RPC Notification (no id requested and no error): acknowledge with 202
-      if (body.id === undefined && !("error" in responsePayload)) {
-        return new Response(null, {
-          status: 202,
-          headers: CORS_HEADERS,
-        });
-      }
-
-      // Stream response via active SSE session if available
-      if (sessionId && sseSessions.has(sessionId)) {
-        const session = sseSessions.get(sessionId)!;
-        try {
-          session.controller.enqueue(
-            encoder.encode(`event: message\ndata: ${JSON.stringify(responsePayload)}\n\n`)
-          );
-          return new Response(JSON.stringify({ status: "accepted", sessionId }), {
-            status: 202,
-            headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-          });
-        } catch {
-          session.close();
-          // Fall through to direct HTTP response fallback
-        }
-      }
-
-      // Direct Fallback: return JSON-RPC response directly with HTTP 200
-      return new Response(JSON.stringify(responsePayload), {
-        status: 200,
-        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-      });
-    }
-
-    // Default Fallback: informative 404
-    return new Response(
-      JSON.stringify({
-        error: "Not Found",
-        message: "Endpoint not found. Supported paths are /, /sse, /mcp, /messages.",
-      }),
-      {
-        status: 404,
-        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-      }
-    );
-  },
-};
-
-/**
- * Handle JSON-RPC 2.0 requests in compliance with Model Context Protocol (MCP)
- */
-async function handleJsonRpc(
-  body: any,
-  env: Env
-): Promise<{ jsonrpc: "2.0"; id: string | number | null; result?: any; error?: any }> {
-  const id = body?.id !== undefined ? body.id : null;
-  const method = body?.method;
-
-  if (body?.jsonrpc !== "2.0" || typeof method !== "string") {
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: { code: -32600, message: "Invalid Request: Must follow JSON-RPC 2.0 specification" },
-    };
-  }
-
-  try {
-    switch (method) {
-      case "initialize": {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            protocolVersion: "2024-11-05",
-            capabilities: {
-              tools: {
-                listChanged: false,
-              },
-            },
-            serverInfo: {
-              name: "telegram-userbot-mcp",
-              version: "3.1.0",
-            },
-          },
-        };
-      }
-
-      case "notifications/initialized": {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {},
-        };
-      }
-
-      case "ping": {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {},
-        };
-      }
-
-      case "tools/list": {
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: {
-            tools: UNIQUE_TOOLS,
-          },
-        };
-      }
-
-      case "tools/call": {
-        const toolName = body.params?.name;
-        const toolArgs = body.params?.arguments || {};
-        const toolResult = await safeExecuteTool(toolName, toolArgs, env);
-
-        return {
-          jsonrpc: "2.0",
-          id,
-          result: toolResult,
-        };
-      }
-
-      default: {
-        return {
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32601,
-            message: `Method not found: ${method}`,
-          },
-        };
-      }
-    }
-  } catch (err: any) {
-    return {
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: -32603,
-        message: err?.message || "Internal server error",
-      },
-    };
-  }
-}
-
-/**
- * Executes requested Telegram tool safely wrapped with timeout protection
- * Returning immediate 200 JSON-RPC error response if connection or execution fails.\n */
-async function safeExecuteTool(
-  name: string,
-  args: Record<string, any>,
-  env: Env
-): Promise<{ content: Array<{ type: "text"; text: string }>; isError: boolean }> {
-  try {
-    const client = await getTelegramClient(env);
-    return await runWithTimeout(
-      dispatchUserbotTool(name, args, client),
-      MAX_TIMEOUT_MS,
-      `Tool '${name}' execution`
-    );
-  } catch (error: any) {
-    return {
-      content: [
-        {
-          type: "text",
-          text: `MTProto Execution/Gateway Error: ${error?.message || String(error)}`,
-        },
-      ],
-      isError: true,
-    };
-  }
-}
+      const stream = new ReadableStream<Uint8Array>({\n        start(controller) {\n          // Flush 2KB comment (: 2048 spaces\\n\\n) to immediately bypass Edge/Proxy buffering\n          controller.enqueue(encoder.encode(`: ${\" \".repeat(2048)}\\n\\n`));\n\n          // Immediately transmit endpoint event with full URL including generated sessionId\n          const endpointUrl = `${url.origin}/messages?sessionId=${sessionId}`;\n          controller.enqueue(encoder.encode(`event: endpoint\\ndata: ${endpointUrl}\\n\\n`));\n\n          const cleanup = () => {\n            if (isCleanedUp) return;\n            isCleanedUp = true;\n            if (intervalId !== null) {\n              clearInterval(intervalId);\n              intervalId = null;\n            }\n            sseSessions.delete(sessionId);\n            try {\n              controller.close();\n            } catch {\n              // Stream already closed or cancelled\n            }\n          };\n\n          // Register session\n          sseSessions.set(sessionId, {\n            controller,\n            close: cleanup,\n          });\n\n          // Periodic Keep-Alive heartbeat every 5 seconds (: keep-alive\\n\\n)\n          intervalId = setInterval(() => {\n            try {\n              controller.enqueue(encoder.encode(\": keep-alive\\n\\n\"));\n            } catch {\n              cleanup();\n            }\n          }, 5000);\n        },\n        cancel() {\n          const session = sseSessions.get(sessionId);\n          if (session) {\n            session.close();\n          }\n        },\n      });\n\n      // Handle client disconnect / abort signal\n      request.signal.addEventListener(\"abort\", () => {\n        const session = sseSessions.get(sessionId);\n        if (session) {\n          session.close();\n        }\n      });\n\n      return new Response(stream, {\n        status: 200,\n        headers: SSE_HEADERS,\n      });\n    }\n\n    // 5. JSON-RPC 2.0 Handler (POST on /, /messages, /sse, or /mcp)\n    if (request.method === \"POST\" && handledPaths.includes(url.pathname)) {\n      const sessionId =\n        url.searchParams.get(\"sessionId\") ||\n        url.searchParams.get(\"session_id\") ||\n        request.headers.get(\"x-session-id\") ||\n        request.headers.get(\"mcp-session-id\") ||\n        undefined;\n\n      let body: any;\n      try {\n        body = await request.json();\n      } catch {\n        return new Response(\n          JSON.stringify({\n            jsonrpc: \"2.0\",\n            id: null,\n            error: { code: -32700, message: \"Parse error: Invalid JSON payload\" },\n          }),\n          {\n            status: 400,\n            headers: { \"Content-Type\": \"application/json\", ...CORS_HEADERS },\n          }\n        );\n      }\n\n      const responsePayload = await handleJsonRpc(body, env);\n\n      // JSON-RPC Notification (no id requested and no error): acknowledge with 202\n      if (body.id === undefined && !(\"error\" in responsePayload)) {\n        return new Response(null, {\n          status: 202,\n          headers: CORS_HEADERS,\n        });\n      }\n\n      // Stream response via active SSE session if available\n      if (sessionId && sseSessions.has(sessionId)) {\n        const session = sseSessions.get(sessionId)!;\n        try {\n          session.controller.enqueue(\n            encoder.encode(`event: message\\ndata: ${JSON.stringify(responsePayload)}\\n\\n`)\n          );\n          return new Response(JSON.stringify({ status: \"accepted\", sessionId }), {\n            status: 202,\n            headers: { \"Content-Type\": \"application/json\", ...CORS_HEADERS },\n          });\n        } catch {\n          session.close();\n          // Fall through to direct HTTP response fallback\n        }\n      }\n\n      // Direct Fallback: return JSON-RPC response directly with HTTP 200\n      return new Response(JSON.stringify(responsePayload), {\n        status: 200,\n        headers: { \"Content-Type\": \"application/json\", ...CORS_HEADERS },\n      });\n    }\n\n    // Default Fallback: informative 404\n    return new Response(\n      JSON.stringify({\n        error: \"Not Found\",\n        message: \"Endpoint not found. Supported paths are /, /sse, /mcp, /messages.\",\n      }),\n      {\n        status: 404,\n        headers: { \"Content-Type\": \"application/json\", ...CORS_HEADERS },\n      }\n    );\n  },\n};\n\n/**\n * Handle JSON-RPC 2.0 requests in compliance with Model Context Protocol (MCP)\n */\nasync function handleJsonRpc(\n  body: any,\n  env: Env\n): Promise<{ jsonrpc: \"2.0\"; id: string | number | null; result?: any; error?: any }> {\n  const id = body?.id !== undefined ? body.id : null;\n  const method = body?.method;\n\n  if (body?.jsonrpc !== \"2.0\" || typeof method !== \"string\") {\n    return {\n      jsonrpc: \"2.0\",\n      id,\n      error: { code: -32600, message: \"Invalid Request: Must follow JSON-RPC 2.0 specification\" },\n    };\n  }\n\n  try {\n    switch (method) {\n      case \"initialize\": {\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          result: {\n            protocolVersion: \"2024-11-05\",\n            capabilities: {\n              tools: {\n                listChanged: false,\n              },\n            },\n            serverInfo: {\n              name: \"telegram-userbot-mcp\",\n              version: \"3.2.0\",\n            },\n          },\n        };\n      }\n\n      case \"notifications/initialized\": {\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          result: {},\n        };\n      }\n\n      case \"ping\": {\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          result: {},\n        };\n      }\n\n      case \"tools/list\": {\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          result: {\n            tools: UNIQUE_TOOLS,\n          },\n        };\n      }\n\n      case \"tools/call\": {\n        const toolName = body.params?.name;\n        const toolArgs = body.params?.arguments || {};\n        const toolResult = await safeExecuteTool(toolName, toolArgs, env);\n\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          result: toolResult,\n        };\n      }\n\n      default: {\n        return {\n          jsonrpc: \"2.0\",\n          id,\n          error: {\n            code: -32601,\n            message: `Method not found: ${method}`,\n          },\n        };\n      }\n    }\n  } catch (err: any) {\n    return {\n      jsonrpc: \"2.0\",\n      id,\n      error: {\n        code: -32603,\n        message: err?.message || \"Internal server error\",\n      },\n    };\n  }\n}\n\n/**\n * Executes requested Telegram tool safely wrapped with timeout protection\n * Returning immediate 200 JSON-RPC error response if connection or execution fails.\\n */\nasync function safeExecuteTool(\n  name: string,\n  args: Record<string, any>,\n  env: Env\n): Promise<{ content: Array<{ type: \"text\"; text: string }>; isError: boolean }> {\n  try {\n    const client = await getTelegramClient(env);\n    return await runWithTimeout(\n      dispatchUserbotTool(name, args, client),\n      MAX_TIMEOUT_MS,\n      `Tool '${name}' execution`\n    );\n  } catch (error: any) {\n    return {\n      content: [\n        {\n          type: \"text\",\n          text: `MTProto Execution/Gateway Error: ${error?.message || String(error)}`,\n        },\n      ],\n      isError: true,\n    };\n  }\n}\n

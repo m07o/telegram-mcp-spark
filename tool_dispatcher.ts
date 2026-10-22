@@ -916,4 +916,9 @@ function errorResult(message: string): { content: Array<{ type: "text"; text: st
     content: [
       {
         type: "text",
-        text: `Error: ${message}`,\n      },\n    ],\n    isError: true,\n  };\n}\n
+        text: `Error: ${message}`,
+      },
+    ],
+    isError: true,
+  };
+}

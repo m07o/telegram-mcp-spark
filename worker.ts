@@ -357,7 +357,7 @@ export default {
         JSON.stringify({
           status: "ok",
           server: "telegram-userbot-mcp",
-          version: "2.1.0",
+          version: "3.0.0",
           totalTools: UNIQUE_TOOLS.length,
           maxTimeoutMs: MAX_TIMEOUT_MS,
           protocol: "MTProto via Telegram Web Gateway (WSS)",
@@ -558,7 +558,7 @@ async function handleJsonRpc(
             },
             serverInfo: {
               name: "telegram-userbot-mcp",
-              version: "2.1.0",
+              version: "3.0.0",
             },
           },
         };
@@ -636,23 +636,11 @@ async function safeExecuteTool(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError: boolean }> {
   try {
     const client = await getTelegramClient(env);
-    const rawResult: any = await runWithTimeout(
+    return await runWithTimeout(
       dispatchUserbotTool(name, args, client),
       MAX_TIMEOUT_MS,
       `Tool '${name}' execution`
     );
-    if (rawResult && Array.isArray(rawResult.content)) {
-      return rawResult;
-    }
-    return {
-      content: [
-        {
-          type: "text",
-          text: typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2),
-        },
-      ],
-      isError: false,
-    };
   } catch (error: any) {
     return {
       content: [

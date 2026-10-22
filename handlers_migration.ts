@@ -425,7 +425,7 @@ export async function handleMigrationTool(
 
       const cutoffTs = Math.floor(Date.now() / 1000) - inactivityDays * 86400;
       const inputChannel = await resolveInputChannel(client, peer);
-      const topics = await fetchAllForumTopics(client, inputChannel, 400);
+      const topics = await fetchAllForumTopics(client, inputChannel, 2000);
       const inactive = topics.filter((t: any) => t.date && t.date < cutoffTs && !t.closed);
 
       const processed: number[] = [];
@@ -490,7 +490,7 @@ export async function handleMigrationTool(
       if (!peer || !query) return errorResult("chat_id and title_query are required.");
 
       const inputChannel = await resolveInputChannel(client, peer);
-      const topics = await fetchAllForumTopics(client, inputChannel, 500, exact ? query : undefined);
+      const topics = await fetchAllForumTopics(client, inputChannel, 2000, exact ? query : undefined);
 
       const qNorm = caseSensitive ? query : normalizeForumTitle(query);
       const matched = topics.filter((t: any) => {
@@ -593,7 +593,7 @@ export async function handleMigrationTool(
       const inactivityDays = Number(args.inactivity_days || 90);
       const cutoffTs = Math.floor(Date.now() / 1000) - inactivityDays * 86400;
       const inputChannel = await resolveInputChannel(client, peer);
-      const topics = await fetchAllForumTopics(client, inputChannel, 500);
+      const topics = await fetchAllForumTopics(client, inputChannel, 2000);
 
       const byNorm = new Map<string, any[]>();
       const deadTopics: any[] = [];
@@ -738,8 +738,8 @@ export async function handleMigrationTool(
       const tgtChannel = await resolveInputChannel(client, tgtChat);
 
       const [srcTopics, tgtTopics] = await Promise.all([
-        fetchAllForumTopics(client, srcChannel, 500),
-        fetchAllForumTopics(client, tgtChannel, 500),
+        fetchAllForumTopics(client, srcChannel, 2000),
+        fetchAllForumTopics(client, tgtChannel, 2000),
       ]);
 
       const tgtByNorm = new Map<string, any[]>();

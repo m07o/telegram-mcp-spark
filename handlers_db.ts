@@ -11,7 +11,10 @@ import {
   REF_MAP_DB,
   RESOLVED_ENTITY_CACHE,
   DB_INITIALIZED,
-  setDbInitialized
+  setDbInitialized,
+  getKvNamespace,
+  persistKvGet,
+  persistKvSet
 } from "./dispatcher_helpers";
 
 export async function handleDbTool(
@@ -34,7 +37,7 @@ export async function handleDbTool(
         { category: "events", count: 2, description: "Real-time incoming message polling and debounced settling", examples: ["wait_for_new_message", "wait_for_settled_message"] },
         { category: "forum_forward", count: 1, description: "Bulk forum topic copying across supergroups without forward tags", examples: ["forward_topics_from_group"] },
         { category: "content", count: 2, description: "Chat content quality analysis, deduplication clustering, and curated migration", examples: ["analyze_chat_content", "curate_content_to_group"] },
-        { category: "database", count: 10, description: "Deduplication tracking, SHA-256 content hashing, series episode auditing, and topic bindings", examples: ["initialize_database", "compute_content_hash_tool", "check_duplicate", "audit_series_sequence", "record_topic_binding"] },
+        { category: "database", count: 10, description: "Deduplication tracking, SHA-256 content hashing, series episode auditing, and topic bindings with Cloudflare KV persistence", examples: ["initialize_database", "compute_content_hash_tool", "check_duplicate", "audit_series_sequence", "record_topic_binding"] },
         { category: "migration", count: 15, description: "Autonomous forum migration, selective topic copy, inactive topic cleanup, and strict episode reordering", examples: ["migrate_topics_autonomous", "migrate_group_comprehensive", "copy_topic_selective", "strict_reorder_topic"] },
       ];
       return successResult({ total_categories: categories.length, total_tools: 172, categories });
@@ -49,10 +52,15 @@ export async function handleDbTool(
     case "telegram_health_check": {
       let me: any = null;
       try { me = await client.getMe(); } catch {}
+      const hasKv = Boolean(getKvNamespace());
       return successResult({
         status: "ok",
         connected: Boolean(client?.connected),
         account: me ? { id: me.id?.toString(), username: me.username || null, first_name: me.firstName || "" } : null,
+        persistence: {
+          kv_storage_bound: hasKv,
+          storage_mode: hasKv ? "Cloudflare KV + In-Memory Cache" : "In-Memory Only",
+        },
         database: {
           initialized: DB_INITIALIZED,
           processed_messages: PROCESSED_MESSAGES_DB.size,
@@ -67,8 +75,10 @@ export async function handleDbTool(
 
     case "initialize_database": {
       setDbInitialized(true);
+      const hasKv = Boolean(getKvNamespace());
       return successResult({
         status: "initialized",
+        persistence: hasKv ? "Cloudflare KV + In-Memory" : "In-Memory",
         tables: ["processed_messages", "series_episodes", "topic_bindings", "migration_jobs", "ref_map"],
         counts: {
           processed_messages: PROCESSED_MESSAGES_DB.size,
@@ -99,8 +109,18 @@ export async function handleDbTool(
       const contentHash = String(args.content_hash || "");
       const compositeKey = `${srcChannel}:${srcMsgId}`;
 
-      const byHash = contentHash ? PROCESSED_MESSAGES_DB.get(contentHash) : null;
-      const byMsg = PROCESSED_MESSAGES_DB.get(compositeKey);
+      let byHash = contentHash ? PROCESSED_MESSAGES_DB.get(contentHash) : null;
+      if (!byHash && contentHash) {
+        byHash = await persistKvGet(`msg_hash:${contentHash}`);
+        if (byHash) PROCESSED_MESSAGES_DB.set(contentHash, byHash);
+      }
+
+      let byMsg = PROCESSED_MESSAGES_DB.get(compositeKey);
+      if (!byMsg && srcChannel && srcMsgId) {
+        byMsg = await persistKvGet(`msg_id:${srcChannel}:${srcMsgId}`);
+        if (byMsg) PROCESSED_MESSAGES_DB.set(compositeKey, byMsg);
+      }
+
       const existing = byHash || byMsg || null;
 
       return successResult({
@@ -124,15 +144,25 @@ export async function handleDbTool(
         failure_reason: args.failure_reason || null,
         updated_at: new Date().toISOString(),
       };
-      if (contentHash) PROCESSED_MESSAGES_DB.set(contentHash, record);
-      if (srcChannel && srcMsgId) PROCESSED_MESSAGES_DB.set(`${srcChannel}:${srcMsgId}`, record);
+      if (contentHash) {
+        PROCESSED_MESSAGES_DB.set(contentHash, record);
+        await persistKvSet(`msg_hash:${contentHash}`, record);
+      }
+      if (srcChannel && srcMsgId) {
+        PROCESSED_MESSAGES_DB.set(`${srcChannel}:${srcMsgId}`, record);
+        await persistKvSet(`msg_id:${srcChannel}:${srcMsgId}`, record);
+      }
       return successResult({ status: "recorded", record });
     }
 
     case "get_message_status_tool":
     case "get_message_status": {
       const contentHash = String(args.content_hash || "");
-      const rec = PROCESSED_MESSAGES_DB.get(contentHash) || null;
+      let rec = PROCESSED_MESSAGES_DB.get(contentHash) || null;
+      if (!rec && contentHash) {
+        rec = await persistKvGet(`msg_hash:${contentHash}`);
+        if (rec) PROCESSED_MESSAGES_DB.set(contentHash, rec);
+      }
       return successResult({ found: Boolean(rec), content_hash: contentHash, record: rec });
     }
 
@@ -203,6 +233,11 @@ export async function handleDbTool(
       };
       TOPIC_BINDINGS_DB.set(`${chatId}::${normSeries}`, binding);
       TOPIC_BINDINGS_DB.set(normSeries, binding);
+
+      // Persist to Cloudflare KV
+      await persistKvSet(`topic_binding:${chatId}:${normSeries}`, binding);
+      await persistKvSet(`topic_binding_global:${normSeries}`, binding);
+
       return successResult({ status: "binding_recorded", binding });
     }
 
@@ -210,10 +245,21 @@ export async function handleDbTool(
       if (args.series_name) {
         const normSeries = normalizeForumTitle(args.series_name);
         const chatId = args.chat_id ? String(args.chat_id) : null;
-        const b =
+        let b =
           (chatId ? TOPIC_BINDINGS_DB.get(`${chatId}::${normSeries}`) : null) ||
           TOPIC_BINDINGS_DB.get(normSeries) ||
           null;
+
+        // Fallback to Cloudflare KV if not found in memory
+        if (!b && chatId) {
+          b = await persistKvGet(`topic_binding:${chatId}:${normSeries}`);
+          if (b) TOPIC_BINDINGS_DB.set(`${chatId}::${normSeries}`, b);
+        }
+        if (!b) {
+          b = await persistKvGet(`topic_binding_global:${normSeries}`);
+          if (b) TOPIC_BINDINGS_DB.set(normSeries, b);
+        }
+
         return successResult({ found: Boolean(b), binding: b });
       }
       const allBindings = Array.from(TOPIC_BINDINGS_DB.values());
@@ -222,13 +268,16 @@ export async function handleDbTool(
 
     case "record_migration_progress": {
       const jobId = String(args.job_id || "default");
-      const existing = MIGRATION_JOBS_DB.get(jobId) || {
-        job_id: jobId,
-        status: "RUNNING",
-        processed_count: 0,
-        topics: {},
-        created_at: new Date().toISOString(),
-      };
+      let existing = MIGRATION_JOBS_DB.get(jobId);
+      if (!existing) {
+        existing = (await persistKvGet(`migration_job:${jobId}`)) || {
+          job_id: jobId,
+          status: "RUNNING",
+          processed_count: 0,
+          topics: {},
+          created_at: new Date().toISOString(),
+        };
+      }
       existing.processed_count += Number(args.increment || 0);
       if (args.status) existing.status = String(args.status);
       if (args.source_topic_id) {
@@ -237,6 +286,10 @@ export async function handleDbTool(
       }
       existing.updated_at = new Date().toISOString();
       MIGRATION_JOBS_DB.set(jobId, existing);
+
+      // Persist to Cloudflare KV
+      await persistKvSet(`migration_job:${jobId}`, existing);
+
       return successResult({ status: "progress_updated", job: existing });
     }
 

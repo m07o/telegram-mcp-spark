@@ -94,8 +94,7 @@ The server provides:
 ## Security Notes
 
 - Never commit `.env`, session strings, or `*.session` files.
-- All SQLite caches (`*.db`, `*.sqlite*`) are excluded via `.gitignore`.
-- User-generated Telegram content is sanitized before being returned to MCP clients.
+- All SQLite caches (`*.db`, `*.sqlite*`) are excluded via `.gitignore`.\n- User-generated Telegram content is sanitized before being returned to MCP clients.
 
 ## License
 

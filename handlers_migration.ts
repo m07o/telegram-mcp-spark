@@ -11,7 +11,10 @@ import {
   resolveEntity,
   resolveInputChannel,
   formatTelegramError,
-  MIGRATION_JOBS_DB
+  MIGRATION_JOBS_DB,
+  withSmartRetry,
+  persistKvSet,
+  persistKvGet
 } from "./dispatcher_helpers";
 
 export async function handleMigrationTool(
@@ -75,7 +78,12 @@ export async function handleMigrationTool(
         const existingTgt = await fetchTopicMessagesChronological(client, tgtEntity, tgtTopicId, 200);
         const idsToDelete = existingTgt.map((m) => Number(m.id)).filter((id) => id !== tgtTopicId);
         if (idsToDelete.length > 0) {
-          await client.deleteMessages(tgtEntity, idsToDelete, { revoke: true });
+          await withSmartRetry(
+            () => client.deleteMessages(tgtEntity, idsToDelete, { revoke: true }),
+            2,
+            6,
+            "wipeTargetMessages"
+          );
           wipedCount = idsToDelete.length;
         }
       }
@@ -86,16 +94,28 @@ export async function handleMigrationTool(
       for (const m of orderedToSend) {
         try {
           if (m.media) {
-            await client.sendFile(tgtEntity, {
-              file: m.media,
-              caption: m.message || "",
-              replyTo: tgtTopicId,
-            });
+            await withSmartRetry(
+              () =>
+                client.sendFile(tgtEntity, {
+                  file: m.media,
+                  caption: m.message || "",
+                  replyTo: tgtTopicId,
+                }),
+              2,
+              8,
+              "sendOrderedMedia"
+            );
           } else if (m.message?.trim()) {
-            await client.sendMessage(tgtEntity, {
-              message: m.message,
-              replyTo: tgtTopicId,
-            });
+            await withSmartRetry(
+              () =>
+                client.sendMessage(tgtEntity, {
+                  message: m.message,
+                  replyTo: tgtTopicId,
+                }),
+              2,
+              8,
+              "sendOrderedText"
+            );
           }
           sentCount++;
           await new Promise((r) => setTimeout(r, delayMs));
@@ -173,7 +193,12 @@ export async function handleMigrationTool(
       const noiseIds = noiseMsgs.map((m) => Number(m.id));
 
       if (!dryRun && noiseIds.length > 0) {
-        await client.deleteMessages(entity, noiseIds, { revoke: true });
+        await withSmartRetry(
+          () => client.deleteMessages(entity, noiseIds, { revoke: true }),
+          2,
+          6,
+          "cleanupNoiseMessages"
+        );
       }
 
       return successResult({
@@ -217,16 +242,28 @@ export async function handleMigrationTool(
 
       for (const msg of toCopy) {
         if (msg.media) {
-          await client.sendFile(tgtEntity, {
-            file: msg.media,
-            caption: msg.message || "",
-            replyTo: tgtTopicId,
-          });
+          await withSmartRetry(
+            () =>
+              client.sendFile(tgtEntity, {
+                file: msg.media,
+                caption: msg.message || "",
+                replyTo: tgtTopicId,
+              }),
+            2,
+            8,
+            "migrateIncrementalFile"
+          );
         } else if (msg.message?.trim()) {
-          await client.sendMessage(tgtEntity, {
-            message: msg.message,
-            replyTo: tgtTopicId,
-          });
+          await withSmartRetry(
+            () =>
+              client.sendMessage(tgtEntity, {
+                message: msg.message,
+                replyTo: tgtTopicId,
+              }),
+            2,
+            8,
+            "migrateIncrementalText"
+          );
         }
         copied++;
         lastId = msg.id;
@@ -370,16 +407,28 @@ export async function handleMigrationTool(
         }
 
         if (m.media) {
-          await client.sendFile(toEntity, {
-            file: m.media,
-            caption: m.message || "",
-            replyTo: targetTopicId,
-          });
+          await withSmartRetry(
+            () =>
+              client.sendFile(toEntity, {
+                file: m.media,
+                caption: m.message || "",
+                replyTo: targetTopicId,
+              }),
+            2,
+            8,
+            "copyTopicSelectiveMedia"
+          );
         } else if (m.message?.trim()) {
-          await client.sendMessage(toEntity, {
-            message: m.message,
-            replyTo: targetTopicId,
-          });
+          await withSmartRetry(
+            () =>
+              client.sendMessage(toEntity, {
+                message: m.message,
+                replyTo: targetTopicId,
+              }),
+            2,
+            8,
+            "copyTopicSelectiveText"
+          );
         }
         copied++;
         await new Promise((r) => setTimeout(r, 150));
@@ -431,13 +480,19 @@ export async function handleMigrationTool(
       const processed: number[] = [];
       if (!dryRun) {
         for (const t of inactive.slice(0, 30)) {
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(t.id),
-              closed: action === "close" ? true : undefined,
-              hidden: action === "hide" ? true : undefined,
-            })
+          await withSmartRetry(
+            () =>
+              client.invoke(
+                new Api.channels.EditForumTopic({
+                  channel: inputChannel,
+                  topicId: Number(t.id),
+                  closed: action === "close" ? true : undefined,
+                  hidden: action === "hide" ? true : undefined,
+                })
+              ),
+            2,
+            6,
+            "editForumTopic"
           );
           processed.push(t.id);
         }
@@ -458,7 +513,12 @@ export async function handleMigrationTool(
       const peer = args.chat_id || args.peer;
       if (!peer) return errorResult("chat_id is required.");
       const entity = await resolveEntity(client, peer);
-      const msgs = await client.getMessages(entity, { limit: 100 });
+      const msgs = await withSmartRetry(
+        () => client.getMessages(entity, { limit: 100 }),
+        2,
+        6,
+        "getChatActivityStats"
+      );
       const byHour: Record<number, number> = {};
       const bySender: Record<string, number> = {};
 
@@ -518,10 +578,16 @@ export async function handleMigrationTool(
       if (!peer) return errorResult("chat_id is required.");
       const entity = await resolveEntity(client, peer);
       const limit = Math.min(Math.max(Number(args.limit) || 50, 1), 200);
-      const msgs = await client.getMessages(entity, {
-        limit,
-        replyTo: args.topic_id ? Number(args.topic_id) : undefined,
-      });
+      const msgs = await withSmartRetry(
+        () =>
+          client.getMessages(entity, {
+            limit,
+            replyTo: args.topic_id ? Number(args.topic_id) : undefined,
+          }),
+        2,
+        6,
+        "exportChatMessages"
+      );
       const exported = msgs.map((m: any) => ({
         id: m.id,
         date: m.date,
@@ -544,29 +610,35 @@ export async function handleMigrationTool(
       const job = MIGRATION_JOBS_DB.get(jobId) || { job_id: jobId, status: "RUNNING" };
       job.webhook_url = String(args.callback_url || "");
       MIGRATION_JOBS_DB.set(jobId, job);
+      await persistKvSet(`migration_job:${jobId}`, job);
       return successResult({
         job_id: jobId,
         callback_url: job.webhook_url,
-        message: "Webhook URL registered in job state.",
+        message: "Webhook URL registered in job state and persisted to KV.",
       });
     }
 
     case "get_migration_state": {
       const jobId = String(args.job_id || "default");
-      const job = MIGRATION_JOBS_DB.get(jobId) || {
+      let job = MIGRATION_JOBS_DB.get(jobId);
+      if (!job) {
+        job = await persistKvGet(`migration_job:${jobId}`);
+        if (job) MIGRATION_JOBS_DB.set(jobId, job);
+      }
+      return successResult(job || {
         job_id: jobId,
         status: "IDLE",
         processed_count: 0,
-      };
-      return successResult(job);
+      });
     }
 
     case "abort_migration": {
       const jobId = String(args.job_id || "default");
-      const job = MIGRATION_JOBS_DB.get(jobId) || { job_id: jobId };
+      let job = MIGRATION_JOBS_DB.get(jobId) || { job_id: jobId };
       job.status = "ABORTED";
       job.aborted_at = new Date().toISOString();
       MIGRATION_JOBS_DB.set(jobId, job);
+      await persistKvSet(`migration_job:${jobId}`, job);
       return successResult({ status: "aborted", job_id: jobId, job });
     }
 
@@ -575,7 +647,12 @@ export async function handleMigrationTool(
       const topicId = Number(args.topic_id);
       if (!peer || !topicId) return errorResult("chat_id and topic_id are required.");
       const entity = await resolveEntity(client, peer);
-      const msgs = await client.getMessages(entity, { replyTo: topicId, limit: 1 });
+      const msgs = await withSmartRetry(
+        () => client.getMessages(entity, { replyTo: topicId, limit: 1 }),
+        2,
+        6,
+        "getTopicTransferStatus"
+      );
       const totalMessages = typeof msgs.total === "number" ? msgs.total : msgs.length;
       return successResult({
         chat_id: peer,
@@ -635,7 +712,12 @@ export async function handleMigrationTool(
 
       const srcEntity = await resolveEntity(client, srcChat);
       const tgtEntity = await resolveEntity(client, tgtChat);
-      const msgs = await client.getMessages(srcEntity, { limit: 50 });
+      const msgs = await withSmartRetry(
+        () => client.getMessages(srcEntity, { limit: 50 }),
+        2,
+        6,
+        "curateGetMessages"
+      );
       const chronological = [...msgs].reverse().filter((m) => !isNoiseMessage(m));
 
       const seenFp = new Set<string>();
@@ -650,17 +732,29 @@ export async function handleMigrationTool(
         }
         seenFp.add(fp);
         if (m.media) {
-          const sent = await client.sendFile(tgtEntity, {
-            file: m.media,
-            caption: m.message || "",
-            replyTo: tgtTopicId,
-          });
+          const sent = await withSmartRetry(
+            () =>
+              client.sendFile(tgtEntity, {
+                file: m.media,
+                caption: m.message || "",
+                replyTo: tgtTopicId,
+              }),
+            2,
+            8,
+            "curateSendFile"
+          );
           copiedIds.push(sent.id);
         } else if (m.message?.trim()) {
-          const sent = await client.sendMessage(tgtEntity, {
-            message: m.message,
-            replyTo: tgtTopicId,
-          });
+          const sent = await withSmartRetry(
+            () =>
+              client.sendMessage(tgtEntity, {
+                message: m.message,
+                replyTo: tgtTopicId,
+              }),
+            2,
+            8,
+            "curateSendMessage"
+          );
           copiedIds.push(sent.id);
         }
         await new Promise((r) => setTimeout(r, 150));
@@ -682,7 +776,12 @@ export async function handleMigrationTool(
       if (!peer) return errorResult("chat_id is required.");
       const entity = await resolveEntity(client, peer);
       const limit = Math.min(Math.max(Number(args.limit) || 100, 1), 200);
-      const msgs = await client.getMessages(entity, { limit });
+      const msgs = await withSmartRetry(
+        () => client.getMessages(entity, { limit }),
+        2,
+        6,
+        "analyzeChatContent"
+      );
 
       const hashClusters = new Map<string, number[]>();
       let mediaCount = 0;
@@ -734,6 +833,11 @@ export async function handleMigrationTool(
       const tgtChat = args.target_chat_id || args.to_chat_id;
       if (!srcChat || !tgtChat) return errorResult("source_chat_id and target_chat_id are required.");
 
+      // New Batching and Cursor Pagination parameters
+      const limit = Math.min(Math.max(Number(args.limit || 50), 1), 200);
+      const offset = Math.max(Number(args.offset || 0), 0);
+      const summaryOnly = Boolean(args.summary_only);
+
       const srcChannel = await resolveInputChannel(client, srcChat);
       const tgtChannel = await resolveInputChannel(client, tgtChat);
 
@@ -773,17 +877,31 @@ export async function handleMigrationTool(
         }
       }
 
+      const pagedMissing = missingInTarget.slice(offset, offset + limit);
+      const pagedExisting = existingInTarget.slice(offset, offset + limit);
+      const pagedDuplicates = duplicatesInTarget.slice(offset, offset + limit);
+
       return successResult({
         source_chat_id: srcChat,
         target_chat_id: tgtChat,
-        source_topics_count: srcTopics.length,
-        target_topics_count: tgtTopics.length,
-        missing_in_target_count: missingInTarget.length,
-        existing_in_target_count: existingInTarget.length,
-        duplicates_in_target_count: duplicatesInTarget.length,
-        missing_in_target: missingInTarget,
-        existing_in_target: existingInTarget,
-        duplicates_in_target: duplicatesInTarget,
+        summary_only: summaryOnly,
+        counts: {
+          source_topics_total: srcTopics.length,
+          target_topics_total: tgtTopics.length,
+          missing_in_target_total: missingInTarget.length,
+          existing_in_target_total: existingInTarget.length,
+          duplicates_in_target_total: duplicatesInTarget.length,
+        },
+        pagination: {
+          offset,
+          limit,
+          missing_returned: summaryOnly ? 0 : pagedMissing.length,
+          has_more_missing: offset + limit < missingInTarget.length,
+          next_offset: offset + limit < missingInTarget.length ? offset + limit : null,
+        },
+        missing_in_target: summaryOnly ? undefined : pagedMissing,
+        existing_in_target: summaryOnly ? undefined : pagedExisting,
+        duplicates_in_target: summaryOnly ? undefined : pagedDuplicates,
       });
     }
 

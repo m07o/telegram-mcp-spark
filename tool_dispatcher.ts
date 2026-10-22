@@ -1,3 +1,7 @@
+import { handleDbTool } from "./handlers_db";
+import { handleMigrationTool } from "./handlers_migration";
+import { handleChatsMessagesTool } from "./handlers_chats_messages";
+import { handleGroupsProfileTool } from "./handlers_groups_profile";
 /**
  * Telegram MTProto Userbot Tool Dispatcher
  * Implements execution logic for tools extracted from the Python codebase using GramJS.
@@ -242,6 +246,19 @@ export async function dispatchUserbotTool(
   client: TelegramClient
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError: boolean }> {
   try {
+    // Check modular handler libraries first for all 172+ tools
+    const dbRes = await handleDbTool(name, args, client);
+    if (dbRes) return dbRes;
+
+    const migRes = await handleMigrationTool(name, args, client, dispatchUserbotTool);
+    if (migRes) return migRes;
+
+    const chatMsgRes = await handleChatsMessagesTool(name, args, client);
+    if (chatMsgRes) return chatMsgRes;
+
+    const grpProfRes = await handleGroupsProfileTool(name, args, client);
+    if (grpProfRes) return grpProfRes;
+
     switch (name) {
       // 1. Core Messaging & Userbot tools
       case "send_user_message":
@@ -852,445 +869,51 @@ export async function dispatchUserbotTool(
                 target_topic_id: targetTopicId,
                 status: targetTopicId ? "created" : "failed",
               });
-              await new Promise((r) => setTimeout(r, 200));
-            } catch (tErr: any) {
+              await new Promise((resolve) => setTimeout(resolve, 300));
+            } catch (err) {
               migratedResults.push({
                 source_topic_id: topic.id,
                 title: topic.title,
-                status: "error",
-                error: formatTelegramError(tErr),
+                status: "failed",
+                error: formatTelegramError(err),
               });
             }
           }
 
           return successResult({
-            status: "migration_batch_completed",
-            source_chat: fromChat,
-            target_chat: toChat,
-            total_in_batch: topics.length,
-            migrated_topics: migratedResults,
-            next_offset_topic: topics.length ? topics[topics.length - 1].id : null,
+            status: "batch_completed",
+            total_attempted: topics.length,
+            topics: migratedResults,
+            next_offset: topics.length ? topics[topics.length - 1].id : null,
           });
         } catch (err: any) {
           return errorResult(formatTelegramError(err, "migrate_topics_autonomous"));
         }
       }
 
-      case "edit_forum_topic":
-      case "edit_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for edit_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(topicId),
-              title: args.title ? String(args.title).trim() : undefined,
-              closed: args.closed !== undefined ? Boolean(args.closed) : undefined,
-              hidden: args.hidden !== undefined ? Boolean(args.hidden) : undefined,
-            })
-          );
-          return successResult({
-            status: "topic_edited",
-            chat_id: peer,
-            topic_id: Number(topicId),
-            title: args.title,
-            closed: args.closed,
-          });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "edit_forum_topic"));
-        }
-      }
-
-      case "delete_forum_topic":
-      case "delete_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for delete_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.DeleteTopicHistory({
-              channel: inputChannel,
-              topMsgId: Number(topicId),
-            })
-          );
-          return successResult({
-            status: "topic_deleted",
-            chat_id: peer,
-            topic_id: Number(topicId),
-          });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "delete_forum_topic"));
-        }
-      }
-
-      case "close_forum_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for close_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(topicId),
-              closed: true,
-            })
-          );
-          return successResult({ status: "topic_closed", chat_id: peer, topic_id: Number(topicId) });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "close_forum_topic"));
-        }
-      }
-
-      case "reopen_forum_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for reopen_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(topicId),
-              closed: false,
-            })
-          );
-          return successResult({ status: "topic_reopened", chat_id: peer, topic_id: Number(topicId) });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "reopen_forum_topic"));
-        }
-      }
-
-      case "hide_forum_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for hide_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(topicId),
-              hidden: true,
-            })
-          );
-          return successResult({ status: "topic_hidden", chat_id: peer, topic_id: Number(topicId) });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "hide_forum_topic"));
-        }
-      }
-
-      case "unhide_forum_topic": {
-        const peer = args.chat_id || args.peer;
-        const topicId = args.topic_id || args.id;
-        if (!peer || !topicId) {
-          return errorResult("chat_id and topic_id are required for unhide_forum_topic.");
-        }
-        try {
-          const inputChannel = await resolveInputChannel(client, peer);
-          await client.invoke(
-            new Api.channels.EditForumTopic({
-              channel: inputChannel,
-              topicId: Number(topicId),
-              hidden: false,
-            })
-          );
-          return successResult({ status: "topic_unhidden", chat_id: peer, topic_id: Number(topicId) });
-        } catch (err: any) {
-          return errorResult(formatTelegramError(err, "unhide_forum_topic"));
-        }
-      }
-
-      // 3. Dialogs and Chats
-      case "list_dialogs":
-      case "get_dialogs":
-      case "get_chats": {
-        const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
-        const dialogs = await client.getDialogs({ limit });
-        const formatted = dialogs.map((d: any) => ({
-          id: d.id?.toString() || null,
-          title: d.title || d.name || "Unknown",
-          isUser: Boolean(d.isUser),
-          isGroup: Boolean(d.isGroup),
-          isChannel: Boolean(d.isChannel),
-          unreadCount: d.unreadCount || 0,
-          lastMessage: d.message?.message || null,
-          date: d.date || null,
-        }));
-        return successResult(formatted);
-      }
-
-      case "get_chat_info":
-      case "get_chat": {
-        const peer = args.chat_id || args.peer;
-        if (!peer) {
-          return errorResult("chat_id is required.");
-        }
-        const entity: any = await resolveEntity(client, peer);
-        return successResult({
-          id: entity.id?.toString(),
-          title: entity.title || entity.firstName || entity.username || "Unknown",
-          username: entity.username || null,
-          phone: entity.phone || null,
-          className: entity.className,
-          verified: Boolean(entity.verified),
-          restricted: Boolean(entity.restricted),
-        });
-      }
-
-      case "join_chat":
-      case "subscribe_public_channel": {
-        const channel = args.channel || args.chat_id || args.username;
-        if (!channel) return errorResult("channel or chat_id is required.");
-        const entity = await resolveEntity(client, channel);
-        await client.invoke(new Api.channels.JoinChannel({ channel: entity }));
-        return successResult({ status: "joined", channel });
-      }
-
-      case "leave_chat": {
-        const channel = args.channel || args.chat_id || args.peer;
-        if (!channel) return errorResult("chat_id is required.");
-        const entity = await resolveEntity(client, channel);
-        await client.invoke(new Api.channels.LeaveChannel({ channel: entity }));
-        return successResult({ status: "left", channel });
-      }
-
-      // 4. Contacts
-      case "list_contacts": {
-        const res: any = await client.invoke(new Api.contacts.GetContacts({ hash: BigInt(0) as any }));
-        const users = (res.users || []).map((u: any) => ({
-          id: u.id?.toString(),
-          firstName: u.firstName || "",
-          lastName: u.lastName || "",
-          username: u.username || null,
-          phone: u.phone || null,
-        }));
-        return successResult(users);
-      }
-
-      case "search_contacts": {
-        const query = args.query || args.q || "";
-        const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 50);
-        const res: any = await client.invoke(new Api.contacts.Search({ q: query, limit }));
-        const users = (res.users || []).map((u: any) => ({
-          id: u.id?.toString(),
-          firstName: u.firstName || "",
-          lastName: u.lastName || "",
-          username: u.username || null,
-        }));
-        return successResult(users);
-      }
-
-      case "add_contact": {
-        const { phone, first_name, last_name = "" } = args;
-        const id = args.id || args.user_id || phone;
-        if (!id || !first_name) {
-          return errorResult("first_name and phone (or id) are required.");
-        }
-        await client.invoke(
-          new Api.contacts.AddContact({
-            id,
-            firstName: first_name,
-            lastName: last_name,
-            phone: phone || "",
-            addPhonePrivacyException: false,
-          })
-        );
-        return successResult({ status: "contact_added", id, first_name });
-      }
-
-      case "delete_contact": {
-        const id = args.id || args.user_id;
-        if (!id) return errorResult("id (user_id) is required.");
-        await client.invoke(new Api.contacts.DeleteContacts({ id: [id] }));
-        return successResult({ status: "contact_deleted", id });
-      }
-
-      case "block_user": {
-        const id = args.id || args.user_id;
-        if (!id) return errorResult("id (user_id) is required.");
-        await client.invoke(new Api.contacts.Block({ id }));
-        return successResult({ status: "user_blocked", id });
-      }
-
-      case "unblock_user": {
-        const id = args.id || args.user_id;
-        if (!id) return errorResult("id (user_id) is required.");
-        await client.invoke(new Api.contacts.Unblock({ id }));
-        return successResult({ status: "user_unblocked", id });
-      }
-
-      case "get_blocked_users": {
-        const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
-        const res: any = await client.invoke(new Api.contacts.GetBlocked({ offset: 0, limit }));
-        return successResult(res.blocked || []);
-      }
-
-      // 5. Groups & Channels
-      case "create_group": {
-        const title = args.title;
-        const userIds = args.user_ids || [];
-        if (!title) return errorResult("title is required.");
-        const res: any = await client.invoke(
-          new Api.messages.CreateChat({
-            users: userIds,
-            title,
-          })
-        );
-        return successResult({ status: "group_created", title, id: res.chats?.[0]?.id?.toString() });
-      }
-
-      case "create_channel": {
-        const { title, about = "" } = args;
-        if (!title) return errorResult("title is required.");
-        const res: any = await client.invoke(
-          new Api.channels.CreateChannel({
-            title,
-            about,
-            broadcast: true,
-            megagroup: false,
-          })
-        );
-        return successResult({ status: "channel_created", title, id: res.chats?.[0]?.id?.toString() });
-      }
-
-      case "get_group_members":
-      case "get_chat_members": {
-        const peer = args.chat_id || args.peer;
-        if (!peer) return errorResult("chat_id is required.");
-        const entity = await resolveEntity(client, peer);
-        const limit = Math.min(Math.max(Number(args.limit) || 20, 1), 100);
-        const participants = await client.getParticipants(entity, { limit });
-        const formatted = participants.map((p: any) => ({
-          id: p.id?.toString(),
-          firstName: p.firstName || "",
-          lastName: p.lastName || "",
-          username: p.username || null,
-        }));
-        return successResult(formatted);
-      }
-
-      case "get_admins": {
-        const peer = args.chat_id || args.peer;
-        if (!peer) return errorResult("chat_id is required.");
-        const entity = await resolveEntity(client, peer);
-        const admins = await client.getParticipants(entity, {
-          filter: new Api.ChannelParticipantsAdmins(),
-        });
-        const formatted = admins.map((a: any) => ({
-          id: a.id?.toString(),
-          firstName: a.firstName || "",
-          username: a.username || null,
-        }));
-        return successResult(formatted);
-      }
-
-      case "get_invite_link": {
-        const peer = args.chat_id || args.peer;
-        if (!peer) return errorResult("chat_id is required.");
-        const entity = await resolveEntity(client, peer);
-        const res: any = await client.invoke(new Api.messages.ExportChatInvite({ peer: entity }));
-        return successResult({ link: res.link });
-      }
-
-      // 6. Profile & Accounts
-      case "get_me":
-      case "list_accounts": {
-        const me: any = await client.getMe();
-        return successResult({
-          id: me.id?.toString(),
-          firstName: me.firstName,
-          lastName: me.lastName || "",
-          username: me.username || null,
-          phone: me.phone || null,
-          isBot: Boolean(me.bot),
-        });
-      }
-
-      case "update_profile": {
-        const { first_name, last_name, about } = args;
-        const res: any = await client.invoke(
-          new Api.account.UpdateProfile({
-            firstName: first_name,
-            lastName: last_name,
-            about,
-          })
-        );
-        return successResult({ status: "profile_updated", user: res.id?.toString() });
-      }
-
-      case "set_username": {
-        const { username } = args;
-        if (!username) return errorResult("username is required.");
-        await client.invoke(new Api.account.UpdateUsername({ username }));
-        return successResult({ status: "username_updated", username });
-      }
-
-      // 7. Media
-      case "send_photo":
-      case "send_file": {
-        const peer = args.chat_id || args.peer;
-        const fileUrl = args.photo_url || args.file_url || args.file || args.url;
-        if (!peer || !fileUrl) return errorResult("chat_id and photo_url/file_url are required.");
-        const entity = await resolveEntity(client, peer);
-        const sent = await client.sendFile(entity, {
-          file: fileUrl,
-          caption: args.caption || "",
-        });
-        return successResult({ status: "sent", id: sent.id, caption: sent.message });
-      }
-
-      // 8. Folders
-      case "list_folders": {
-        const res: any = await client.invoke(new Api.messages.GetDialogFilters());
-        return successResult(res.filters || []);
-      }
-
-      // 9. Diagnostics / Status
-      case "diagnostics":
-      case "ping": {
-        const me: any = await client.getMe();
-        return successResult({
-          status: "healthy",
-          connected: client.connected,
-          user: me?.username || me?.firstName || "Connected",
-        });
-      }
-
-      // Fallback for tools not yet explicitly implemented
-      default: {
+      default:
         return errorResult(`Tool '${name}' is not currently implemented on this server.`);
-      }
     }
   } catch (err: any) {
-    return errorResult(`MTProto Error in ${name}: ${err?.message || String(err)}`);
+    return errorResult(`Unhandled dispatcher error: ${err?.message || String(err)}`);
   }
 }
 
-function successResult(data: any) {
+function successResult(data: any): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
   return {
-    content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(data, null, 2),
+      },
+    ],
     isError: false,
   };
 }
 
-function errorResult(message: string) {
+function errorResult(message: string): { content: Array<{ type: "text"; text: string }>; isError: boolean } {
   return {
-    content: [{ type: "text" as const, text: `Validation/Error: ${message}` }],
-    isError: true,
-  };
-}
+    content: [
+      {
+        type: "text",
+        text: `Error: ${message}`,\n      },\n    ],\n    isError: true,\n  };\n}\n

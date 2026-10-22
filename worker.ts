@@ -636,11 +636,23 @@ async function safeExecuteTool(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError: boolean }> {
   try {
     const client = await getTelegramClient(env);
-    return await runWithTimeout(
+    const rawResult: any = await runWithTimeout(
       dispatchUserbotTool(name, args, client),
       MAX_TIMEOUT_MS,
       `Tool '${name}' execution`
     );
+    if (rawResult && Array.isArray(rawResult.content)) {
+      return rawResult;
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2),
+        },
+      ],
+      isError: false,
+    };
   } catch (error: any) {
     return {
       content: [

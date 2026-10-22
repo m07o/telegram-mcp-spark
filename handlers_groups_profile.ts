@@ -489,7 +489,7 @@ export async function handleGroupsProfileTool(
       const waitMs = Math.min(Number(args.settle_ms || (args.timeout ? args.timeout * 1000 : 2000)), 5000);
       await new Promise((r) => setTimeout(r, waitMs));
       const dialogs = await client.getDialogs({ limit: 20 });
-      const unread = dialogs.filter((d: any) => (d.unreadCount || 0) > 0).map((d: any) => ({
+      const unread = dialogs.filter((d: any) => (d.unreadCount || 0) > 0).map((d: any) => ({\
         chat_id: d.id?.toString(), title: d.title || d.name || "Unknown", unread_count: d.unreadCount
       }));
       return successResult({ count: unread.length, unread_chats: unread });

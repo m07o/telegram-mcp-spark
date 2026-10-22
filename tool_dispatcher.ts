@@ -1,14 +1,91 @@
 import { Api, TelegramClient } from "telegram";
 
-async function resolveChannel(client: TelegramClient, chatId: string | number) {
+/**
+ * Resolves any peer (User, Chat, Channel, "me") with automatic dialog cache warm-up.
+ */
+async function resolvePeer(client: TelegramClient, peer: string | number): Promise<any> {
+  const str = String(peer).trim();
+  if (str === "me" || str === "self" || str === "this") {
+    return await client.getInputEntity("me");
+  }
+
+  let target: any = peer;
+  if (/^-?\d+$/.test(str)) {
+    target = Number(str);
+  }
+
+  try {
+    const ent = await client.getEntity(target);
+    return await client.getInputEntity(ent);
+  } catch (err) {
+    // Warm up entity cache with recent dialogs
+    try {
+      await client.getDialogs({ limit: 100 });
+      const ent = await client.getEntity(target);
+      return await client.getInputEntity(ent);
+    } catch {
+      if (str.startsWith("-100")) {
+        const bare = Number(str.replace(/^-100/, ""));
+        try {
+          const ent = await client.getEntity(bare);
+          return await client.getInputEntity(ent);
+        } catch {}
+      } else if (/^\d+$/.test(str)) {
+        try {
+          const ent = await client.getEntity(Number(`-100${str}`));
+          return await client.getInputEntity(ent);
+        } catch {}
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Resolves an entity specifically as a Channel/Supergroup InputChannel.
+ */
+async function resolveChannel(client: TelegramClient, chatId: string | number): Promise<any> {
+  const str = String(chatId).trim();
   let target: any = chatId;
-  if (typeof target === "string" && /^-?\d+$/.test(target)) {
-    target = Number(target);
+  if (/^-?\d+$/.test(str)) {
+    target = Number(str);
   }
-  const entity: any = await client.getEntity(target);
-  if (!entity || (!entity.broadcast && !entity.megagroup && entity.className !== "Channel")) {
-    throw new Error(`Resolved entity for ${chatId} is not a valid Channel/Supergroup.`);
+
+  let entity: any = null;
+  try {
+    entity = await client.getEntity(target);
+  } catch (err) {
+    try {
+      await client.getDialogs({ limit: 100 });
+      entity = await client.getEntity(target);
+    } catch {
+      if (str.startsWith("-100")) {
+        const bare = Number(str.replace(/^-100/, ""));
+        try {
+          entity = await client.getEntity(bare);
+        } catch {
+          throw err;
+        }
+      } else if (/^\d+$/.test(str)) {
+        try {
+          entity = await client.getEntity(Number(`-100${str}`));
+        } catch {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
   }
+
+  if (!entity) {
+    throw new Error(`Could not resolve entity for chat ${chatId}. Ensure the userbot is a member.`);
+  }
+
+  if (!entity.broadcast && !entity.megagroup && entity.className !== "Channel") {
+    throw new Error(`Resolved entity for ${chatId} (${entity.className}) is not a valid Channel/Supergroup.`);
+  }
+
   return await client.getInputEntity(entity);
 }
 
@@ -18,15 +95,23 @@ export async function dispatchUserbotTool(
   client: TelegramClient
 ): Promise<any> {
   switch (name) {
-    case "read_chat_history": {
-      const chatId = args.chat_id;
+    case "list_dialogs": {
       const limit = Math.min(Number(args.limit) || 20, 100);
-      let target: any = chatId;
-      if (typeof target === "string" && /^-?\d+$/.test(target)) {
-        target = Number(target);
-      }
-      const entity = await client.getEntity(target);
-      const messages: any = await client.getMessages(entity, { limit });
+      const dialogs: any = await client.getDialogs({ limit });
+      return dialogs.map((d: any) => ({
+        id: d.id ? String(d.id) : null,
+        title: d.title || d.name || "",
+        isChannel: Boolean(d.isChannel),
+        isGroup: Boolean(d.isGroup),
+        isUser: Boolean(d.isUser),
+        unreadCount: d.unreadCount || 0,
+      }));
+    }
+
+    case "read_chat_history": {
+      const peer = await resolvePeer(client, args.chat_id);
+      const limit = Math.min(Number(args.limit) || 20, 100);
+      const messages: any = await client.getMessages(peer, { limit });
       return messages.map((m: any) => ({
         id: m.id,
         date: m.date,
@@ -39,14 +124,9 @@ export async function dispatchUserbotTool(
     }
 
     case "send_user_message": {
-      const chatId = args.chat_id;
+      const peer = await resolvePeer(client, args.chat_id);
       const text = args.text || args.message;
-      let target: any = chatId;
-      if (typeof target === "string" && /^-?\d+$/.test(target)) {
-        target = Number(target);
-      }
-      const entity = await client.getEntity(target);
-      const sent: any = await client.sendMessage(entity, { message: text });
+      const sent: any = await client.sendMessage(peer, { message: text });
       return { success: true, messageId: sent.id };
     }
 
@@ -70,9 +150,9 @@ export async function dispatchUserbotTool(
         top_message_id: t.topMessage,
         unread_count: t.unreadCount,
         unread_mentions_count: t.unreadMentionsCount,
-        closed: t.closed || false,
-        pinned: t.pinned || false,
-        hidden: t.hidden || false,
+        closed: Boolean(t.closed),
+        pinned: Boolean(t.pinned),
+        hidden: Boolean(t.hidden),
         icon_color: t.iconColor,
         icon_emoji_id: t.iconEmojiId ? String(t.iconEmojiId) : null,
       }));
@@ -88,12 +168,29 @@ export async function dispatchUserbotTool(
       };
     }
 
+    case "count_topics": {
+      const channel = await resolveChannel(client, args.chat_id);
+      const res: any = await client.invoke(
+        new Api.channels.GetForumTopics({
+          channel,
+          offsetDate: 0,
+          offsetId: 0,
+          offsetTopic: 0,
+          limit: 1,
+        })
+      );
+      return {
+        chat_id: args.chat_id,
+        count: res.count ?? res.topics?.length ?? 0,
+      };
+    }
+
     case "create_forum_topic": {
       const channel = await resolveChannel(client, args.chat_id);
       const res: any = await client.invoke(
         new Api.channels.CreateForumTopic({
           channel,
-          title: args.title,
+          title: String(args.title).trim().slice(0, 128),
           iconColor: args.icon_color ? Number(args.icon_color) : undefined,
           iconEmojiId: args.icon_emoji_id ? (args.icon_emoji_id as any) : undefined,
         })
@@ -294,15 +391,7 @@ export async function dispatchUserbotTool(
     }
 
     case "search_messages": {
-      let peer: any = undefined;
-      if (args.chat_id) {
-        let target: any = args.chat_id;
-        if (typeof target === "string" && /^-?\d+$/.test(target)) {
-          target = Number(target);
-        }
-        const ent = await client.getEntity(target);
-        peer = await client.getInputEntity(ent);
-      }
+      const peer = args.chat_id ? await resolvePeer(client, args.chat_id) : undefined;
       const query = args.query || "";
       const limit = Math.min(Number(args.limit) || 20, 100);
       const messages: any = await client.getMessages(peer, {

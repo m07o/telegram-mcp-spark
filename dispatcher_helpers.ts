@@ -58,11 +58,11 @@ export function extractEpisodeInfo(text: string): { season: number; episode: num
     return { season: parseInt(mSeason[1], 10), episode: parseInt(mSeason[2], 10) };
   }
   const patterns = [
-    /(?:الحلقة|حلقه|حلقة)\s*(\d{1,3})/i,
-    /\b(?:EP|E)\s?-?(\d{1,3})\b/i,
-    /^(\d{1,3})[.\-\s]/m,
-    /\bab[i1l]\s?0?(\d{1,3})\b/i,
-    /\bbrother\s*0?(\d{1,3})\b/i,
+    /(?:الحلقة|حلقه|حلقة)\s*(\\d{1,3})/i,
+    /\b(?:EP|E)\s?-?(\\d{1,3})\b/i,
+    /^(\\d{1,3})[.\\-\\s]/m,
+    /\bab[i1l]\s?0?(\\d{1,3})\b/i,
+    /\bbrother\s*0?(\\d{1,3})\b/i,
   ];
   for (const pat of patterns) {
     const m = t.match(pat);
@@ -114,7 +114,7 @@ export function getMessageFingerprint(msg: any): string {
 export async function fetchAllForumTopics(
   client: TelegramClient,
   inputChannel: Api.InputChannel,
-  maxTopics: number = 500,
+  maxTopics: number = 2000,
   searchQuery?: string
 ): Promise<any[]> {
   const allTopics: any[] = [];
@@ -123,7 +123,8 @@ export async function fetchAllForumTopics(
   let offsetDate = 0;
   const startTime = Date.now();
 
-  while (allTopics.length < maxTopics && Date.now() - startTime < 18000) {
+  // Allow up to 7 minutes (420,000ms) within the 8-minute budget to fetch all topics
+  while (allTopics.length < maxTopics && Date.now() - startTime < 420000) {
     const res: any = await client.invoke(
       new Api.channels.GetForumTopics({
         channel: inputChannel,
@@ -172,7 +173,7 @@ export function formatTelegramError(err: any, context?: string): string {
   const prefix = context ? `[${context}] ` : "";
 
   if (err.seconds || name.includes("FloodWait") || msg.includes("FLOOD_WAIT")) {
-    const secs = err.seconds || msg.match(/\d+/)?.[0] || "several";
+    const secs = err.seconds || msg.match(/\\d+/)?.[0] || "several";
     return `${prefix}FloodWaitError: Telegram requires waiting ${secs} seconds before repeating this action.`;
   }
   if (msg.includes("CHAT_WRITE_FORBIDDEN") || name.includes("ChatWriteForbidden")) {
@@ -232,7 +233,7 @@ export async function resolveEntity(client: TelegramClient, peer: any): Promise<
 
   let normalizedKey = peerStr;
   let bareNumericKey = "";
-  if (/^\d+$/.test(peerStr)) {
+  if (/^\\d+$/.test(peerStr)) {
     bareNumericKey = peerStr;
     normalizedKey = `-100${peerStr}`;
   } else if (peerStr.startsWith("-100")) {

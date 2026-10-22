@@ -259,7 +259,7 @@ export async function handleGroupsProfileTool(
     case "import_chat_invite": {
       const raw = String(args.link || args.hash || "").trim();
       if (!raw) return errorResult("link or hash is required.");
-      const hashMatch = raw.match(/(?:\\+|joinchat\\/)([A-Za-z0-9_-]+)/);
+      const hashMatch = raw.match(/(?:\+|joinchat\/)([-A-Za-z0-9_]+)/);
       const hash = hashMatch ? hashMatch[1] : raw.replace(/^https?:\/\/t\.me\//, "");
       const res: any = await client.invoke(new Api.messages.ImportChatInvite({ hash }));
       return successResult({ status: "joined_by_invite", chat_id: res.chats?.[0]?.id?.toString() || null });
@@ -435,7 +435,7 @@ export async function handleGroupsProfileTool(
 
     case "set_bot_commands": {
       const cmds = (Array.isArray(args.commands) ? args.commands : []).map(
-        (c: any) => new Api.BotCommand({ command: String(c.command || "").replace(/^\\//, ""), description: String(c.description || "") })
+        (c: any) => new Api.BotCommand({ command: String(c.command || "").replace(/^\//, ""), description: String(c.description || "") })
       );
       await client.invoke(new Api.bots.SetBotCommands({ scope: new Api.BotCommandScopeDefault(), langCode: "", commands: cmds }));
       return successResult({ status: "bot_commands_updated", count: cmds.length });

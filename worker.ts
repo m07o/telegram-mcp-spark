@@ -80,8 +80,8 @@ class TelegramCloudflareWebSockets extends PromisedWebSockets {
   }
 }
 
-// Timeout helper using Promise.race to guarantee the Worker never hangs (increased to 120s for bulk topics and media)
-const MAX_TIMEOUT_MS = 120000;
+// Timeout helper using Promise.race to guarantee the Worker never hangs (increased to 8 minutes = 480,000ms for bulk topic sync)
+const MAX_TIMEOUT_MS = 480000;
 
 async function runWithTimeout<T>(
   promise: Promise<T>,
@@ -126,7 +126,6 @@ const encoder = new TextEncoder();
 // Combine all 167 tools with friendly Userbot aliases
 const ALL_TOOLS: McpToolDefinition[] = [
   ...MCP_TOOLS,
-  // Include explicit aliases requested if not already existing
   {
     name: "read_chat_history",
     description: "Fetch message history from any private chat (DM), group, or channel using your personal Telegram account.",
@@ -194,6 +193,20 @@ const ALL_TOOLS: McpToolDefinition[] = [
           default: "activity",
         },
         search_query: { type: "string", description: "Optional title search query" },
+      },
+      required: ["chat_id"],
+    },
+  },
+  {
+    name: "count_topics",
+    description: "Count the TRUE total number of forum topics in a supergroup, paginating past Telegram's 100-per-request limit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        chat_id: {
+          type: ["string", "number"],
+          description: "The ID or username of the forum supergroup (e.g. -1002191043427 or 2191043427).",
+        },
       },
       required: ["chat_id"],
     },
@@ -310,9 +323,9 @@ async function getTelegramClient(env: Env): Promise<TelegramClient> {
         connection: ConnectionTCPObfuscated,
         networkSocket: BoundWebSockets,
         useWSS: true,
-        connectionRetries: 1,
-        requestRetries: 2,
-        timeout: 5,
+        connectionRetries: 2,
+        requestRetries: 3,
+        timeout: 10,
         autoReconnect: false,
         floodSleepThreshold: 0, // Disable automatic sleeping on FloodWait to prevent worker timeouts
       });
@@ -357,7 +370,7 @@ export default {
         JSON.stringify({
           status: "ok",
           server: "telegram-userbot-mcp",
-          version: "3.0.0",
+          version: "3.1.0",
           totalTools: UNIQUE_TOOLS.length,
           maxTimeoutMs: MAX_TIMEOUT_MS,
           protocol: "MTProto via Telegram Web Gateway (WSS)",
@@ -558,7 +571,7 @@ async function handleJsonRpc(
             },
             serverInfo: {
               name: "telegram-userbot-mcp",
-              version: "3.0.0",
+              version: "3.1.0",
             },
           },
         };
@@ -627,8 +640,7 @@ async function handleJsonRpc(
 
 /**
  * Executes requested Telegram tool safely wrapped with timeout protection
- * Returning immediate 200 JSON-RPC error response if connection or execution fails.
- */
+ * Returning immediate 200 JSON-RPC error response if connection or execution fails.\n */
 async function safeExecuteTool(
   name: string,
   args: Record<string, any>,

@@ -8,6 +8,85 @@ export const MIGRATION_JOBS_DB = new Map<string, any>();
 export const REF_MAP_DB = new Map<string, any[]>();
 export let DB_INITIALIZED = true;
 
+// Active Cloudflare KV Namespace reference (if bound in environment)
+export let ACTIVE_KV_NAMESPACE: any = null;
+
+export function setKvNamespace(kv: any) {
+  ACTIVE_KV_NAMESPACE = kv;
+}
+
+export function getKvNamespace() {
+  return ACTIVE_KV_NAMESPACE;
+}
+
+/**
+ * Cloudflare KV asynchronous persistence helpers with graceful in-memory fallback
+ */
+export async function persistKvSet(key: string, value: any, expirationTtlSecs?: number): Promise<void> {
+  if (ACTIVE_KV_NAMESPACE && typeof ACTIVE_KV_NAMESPACE.put === "function") {
+    try {
+      const opts = expirationTtlSecs ? { expirationTtl: expirationTtlSecs } : undefined;
+      await ACTIVE_KV_NAMESPACE.put(key, JSON.stringify(value), opts);
+    } catch (err) {
+      console.warn(`[KV_PUT_ERROR] key ${key}:`, err);
+    }
+  }
+}
+
+export async function persistKvGet<T = any>(key: string): Promise<T | null> {
+  if (ACTIVE_KV_NAMESPACE && typeof ACTIVE_KV_NAMESPACE.get === "function") {
+    try {
+      const val = await ACTIVE_KV_NAMESPACE.get(key, "json");
+      return val as T;
+    } catch (err) {
+      console.warn(`[KV_GET_ERROR] key ${key}:`, err);
+    }
+  }
+  return null;
+}
+
+export async function persistKvDelete(key: string): Promise<void> {
+  if (ACTIVE_KV_NAMESPACE && typeof ACTIVE_KV_NAMESPACE.delete === "function") {
+    try {
+      await ACTIVE_KV_NAMESPACE.delete(key);
+    } catch (err) {
+      console.warn(`[KV_DELETE_ERROR] key ${key}:`, err);
+    }
+  }
+}
+
+/**
+ * Smart Auto-Retry helper for MTProto operations:
+ * Automatically pauses and retries when Telegram returns minor FloodWait (<= maxWaitSecs).
+ * Completely transparent to user commands and prevents operation failure on transient rate limits.
+ */
+export async function withSmartRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries: number = 2,
+  maxWaitSecs: number = 10,
+  opName: string = "MTProto operation"
+): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      attempt++;
+      const msg = String(err?.errorMessage || err?.message || "");
+      const isFlood = Boolean(err?.seconds || msg.includes("FLOOD_WAIT") || err?.name === "FloodWaitError");
+      const waitSecs = Number(err?.seconds || msg.match(/\d+/)?.[0] || 0);
+
+      if (isFlood && waitSecs > 0 && waitSecs <= maxWaitSecs && attempt <= maxRetries) {
+        const sleepMs = waitSecs * 1000 + 500;
+        console.warn(`[SmartRetry] ${opName}: FloodWait of ${waitSecs}s received. Auto-sleeping ${sleepMs}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise((r) => setTimeout(r, sleepMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export function setDbInitialized(val: boolean) {
   DB_INITIALIZED = val;
 }
@@ -58,11 +137,11 @@ export function extractEpisodeInfo(text: string): { season: number; episode: num
     return { season: parseInt(mSeason[1], 10), episode: parseInt(mSeason[2], 10) };
   }
   const patterns = [
-    /(?:الحلقة|حلقه|حلقة)\s*(\\d{1,3})/i,
-    /\b(?:EP|E)\s?-?(\\d{1,3})\b/i,
-    /^(\\d{1,3})[.\\-\\s]/m,
-    /\bab[i1l]\s?0?(\\d{1,3})\b/i,
-    /\bbrother\s*0?(\\d{1,3})\b/i,
+    /(?:الحلقة|حلقه|حلقة)\s*(\d{1,3})/i,
+    /\b(?:EP|E)\s?-?(\d{1,3})\b/i,
+    /^(\d{1,3})[.\-\s]/m,
+    /\bab[i1l]\s?0?(\d{1,3})\b/i,
+    /\bbrother\s*0?(\d{1,3})\b/i,
   ];
   for (const pat of patterns) {
     const m = t.match(pat);
@@ -123,17 +202,23 @@ export async function fetchAllForumTopics(
   let offsetDate = 0;
   const startTime = Date.now();
 
-  // Allow up to 7 minutes (420,000ms) within the 8-minute budget to fetch all topics
+  // Allow up to 7 minutes (420,000ms) with smart auto-retry protection
   while (allTopics.length < maxTopics && Date.now() - startTime < 420000) {
-    const res: any = await client.invoke(
-      new Api.channels.GetForumTopics({
-        channel: inputChannel,
-        q: searchQuery || undefined,
-        offsetDate,
-        offsetId,
-        offsetTopic,
-        limit: Math.min(100, maxTopics - allTopics.length),
-      })
+    const res: any = await withSmartRetry(
+      () =>
+        client.invoke(
+          new Api.channels.GetForumTopics({
+            channel: inputChannel,
+            q: searchQuery || undefined,
+            offsetDate,
+            offsetId,
+            offsetTopic,
+            limit: Math.min(100, maxTopics - allTopics.length),
+          })
+        ),
+      2,
+      8,
+      "GetForumTopics"
     );
     const batch = res.topics || [];
     if (!batch.length) break;
@@ -159,10 +244,16 @@ export async function fetchTopicMessagesChronological(
   maxMessages: number = 200
 ): Promise<any[]> {
   const limit = maxMessages > 0 ? Math.min(maxMessages, 500) : 200;
-  const msgs = await client.getMessages(entity, {
-    replyTo: Number(topicId),
-    limit,
-  });
+  const msgs = await withSmartRetry(
+    () =>
+      client.getMessages(entity, {
+        replyTo: Number(topicId),
+        limit,
+      }),
+    2,
+    6,
+    "getTopicMessages"
+  );
   return [...msgs].filter((m: any) => m && m.id !== Number(topicId)).reverse();
 }
 
@@ -173,7 +264,7 @@ export function formatTelegramError(err: any, context?: string): string {
   const prefix = context ? `[${context}] ` : "";
 
   if (err.seconds || name.includes("FloodWait") || msg.includes("FLOOD_WAIT")) {
-    const secs = err.seconds || msg.match(/\\d+/)?.[0] || "several";
+    const secs = err.seconds || msg.match(/\d+/)?.[0] || "several";
     return `${prefix}FloodWaitError: Telegram requires waiting ${secs} seconds before repeating this action.`;
   }
   if (msg.includes("CHAT_WRITE_FORBIDDEN") || name.includes("ChatWriteForbidden")) {
@@ -233,7 +324,7 @@ export async function resolveEntity(client: TelegramClient, peer: any): Promise<
 
   let normalizedKey = peerStr;
   let bareNumericKey = "";
-  if (/^\\d+$/.test(peerStr)) {
+  if (/^\d+$/.test(peerStr)) {
     bareNumericKey = peerStr;
     normalizedKey = `-100${peerStr}`;
   } else if (peerStr.startsWith("-100")) {

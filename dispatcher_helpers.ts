@@ -6,6 +6,7 @@ export const SERIES_EPISODES_DB = new Map<string, any>();
 export const TOPIC_BINDINGS_DB = new Map<string, any>();
 export const MIGRATION_JOBS_DB = new Map<string, any>();
 export const REF_MAP_DB = new Map<string, any[]>();
+export const AUDIT_CHECKPOINTS_DB = new Map<string, any>();
 export let DB_INITIALIZED = true;
 
 // Active Cloudflare KV Namespace reference (if bound in environment)

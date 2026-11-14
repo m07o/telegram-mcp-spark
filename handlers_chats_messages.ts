@@ -7,7 +7,8 @@ import {
   resolveEntity,
   resolveInputChannel,
   extractTopicId,
-  fetchAllForumTopics
+  fetchAllForumTopics,
+  withSmartRetry
 } from "./dispatcher_helpers";
 
 export async function handleChatsMessagesTool(
@@ -250,18 +251,85 @@ export async function handleChatsMessagesTool(
       const rawIds = Array.isArray(args.message_ids) ? args.message_ids : [args.message_ids];
       const msgIds = rawIds.map(Number).filter((n: number) => !isNaN(n) && n > 0);
       if (!fromChat || !toChat || !msgIds.length) return errorResult("from_chat_id, message_ids, and to_chat_id are required.");
+      const delayMs = Math.max(Number(args.delay ?? 0.5) * 1000, 100);
+      const batchSize = Math.max(Number(args.batch_size ?? 10), 0);
+      const pauseMs = Math.max(Number(args.pause_seconds ?? 3.0) * 1000, 0);
+
       const fromEntity = await resolveEntity(client, fromChat);
       const toEntity = await resolveEntity(client, toChat);
       const msgs = await client.getMessages(fromEntity, { ids: msgIds });
       const replyTo = args.reply_to ? Number(args.reply_to) : undefined;
       const copiedIds: number[] = [];
+
       for (const msg of msgs) {
         if (!msg) continue;
-        const sent = msg.media ? await client.sendFile(toEntity, { file: msg.media, caption: msg.message || "", replyTo }) : await client.sendMessage(toEntity, { message: msg.message, replyTo });
+        const sent = await withSmartRetry(
+          () =>
+            msg.media
+              ? client.sendFile(toEntity, { file: msg.media, caption: msg.message || "", replyTo })
+              : client.sendMessage(toEntity, { message: msg.message, replyTo }),
+          3,
+          10,
+          "copy_messages"
+        );
         if (sent?.id) copiedIds.push(sent.id);
-        await new Promise((r) => setTimeout(r, 150));
+        await new Promise((r) => setTimeout(r, delayMs));
+        if (batchSize > 0 && copiedIds.length % batchSize === 0 && pauseMs > 0) {
+          await new Promise((r) => setTimeout(r, pauseMs));
+        }
       }
       return successResult({ status: "copied_batch", copied_count: copiedIds.length, new_message_ids: copiedIds });
+    }
+
+    case "batch_edit_captions": {
+      const peer = args.chat_id || args.peer;
+      const edits = Array.isArray(args.edits) ? args.edits : [];
+      if (!peer || !edits.length) return errorResult("chat_id and non-empty edits array are required.");
+
+      const delayMs = Math.max(Number(args.delay ?? 0.5) * 1000, 100);
+      const batchSize = Math.max(Number(args.batch_size ?? 10), 0);
+      const pauseMs = Math.max(Number(args.pause_seconds ?? 3.0) * 1000, 0);
+
+      const entity = await resolveEntity(client, peer);
+      let editedCount = 0;
+      const failed: Array<{ message_id: number; error: string }> = [];
+
+      for (let i = 0; i < edits.length; i++) {
+        const item = edits[i];
+        const msgId = Number(item?.message_id || item?.id);
+        const newCaption = String(item?.caption ?? item?.text ?? "");
+        if (!msgId) {
+          failed.push({ message_id: 0, error: "Invalid message_id" });
+          continue;
+        }
+        try {
+          await withSmartRetry(
+            () => client.editMessage(entity, { message: msgId, text: newCaption }),
+            3,
+            10,
+            `batch_edit_captions:${msgId}`
+          );
+          editedCount++;
+        } catch (err: any) {
+          failed.push({ message_id: msgId, error: err?.message || String(err) });
+        }
+
+        if (i < edits.length - 1) {
+          await new Promise((r) => setTimeout(r, delayMs));
+          if (batchSize > 0 && (i + 1) % batchSize === 0 && pauseMs > 0) {
+            await new Promise((r) => setTimeout(r, pauseMs));
+          }
+        }
+      }
+
+      return successResult({
+        status: "SUCCESS",
+        chat_id: peer,
+        total_requested: edits.length,
+        edited_count: editedCount,
+        failed_count: failed.length,
+        failed: failed.slice(0, 20),
+      });
     }
 
     case "send_scheduled_message": {

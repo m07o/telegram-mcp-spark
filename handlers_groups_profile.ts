@@ -44,7 +44,7 @@ export async function handleGroupsProfileTool(
       const peer = args.contact_id || args.user_id;
       if (!peer) return errorResult("contact_id is required.");
       const entity: any = await resolveEntity(client, peer);
-      const commonRes: any = await client.invoke(new Api.messages.GetCommonChats({ userId: entity, maxId: BigInt(0) as any, limit: 100 }));
+      const commonRes: any = await client.invoke(new Api.messages.GetCommonChats({ userId: entity, maxId: BigInt(args.max_id || 0) as any, limit: 100 }));
       const commonChats = (commonRes.chats || []).map((c: any) => ({ id: c.id?.toString(), title: c.title || "Unknown" }));
       return successResult({ contact_id: String(peer), common_chats_count: commonChats.length, common_chats: commonChats });
     }
@@ -346,6 +346,29 @@ export async function handleGroupsProfileTool(
       const t = res.topics?.[0];
       if (!t || t.className === "ForumTopicDeleted") return successResult({ valid: false, can_post: false, topic_id: topicId });
       return successResult({ valid: true, can_post: !t.closed, topic_id: t.id, title: t.title || "" });
+    }
+
+    case "delete_topic": {
+      const peer = args.chat_id || args.peer;
+      const topicId = Number(args.topic_id);
+      if (!peer || !topicId) return errorResult("chat_id and topic_id are required.");
+      const inputChannel = await resolveInputChannel(client, peer);
+      try {
+        await client.invoke(new Api.channels.DeleteTopicHistory({ channel: inputChannel, topMsgId: topicId }));
+        return successResult({ status: "SUCCESS", chat_id: peer, topic_id: topicId, deleted: true });
+      } catch (err: any) {
+        const msg = String(err?.errorMessage || err?.message || err).toUpperCase();
+        if (msg.includes("TOPIC_ID_INVALID")) {
+          return successResult({
+            status: "SUCCESS",
+            already_deleted: true,
+            topic_id: topicId,
+            deleted: true,
+            success: true,
+          });
+        }
+        throw err;
+      }
     }
 
     case "publish_media_with_template": {

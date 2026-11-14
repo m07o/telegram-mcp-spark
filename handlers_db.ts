@@ -1,4 +1,4 @@
-import { TelegramClient, Api } from "telegram";
+import { TelegramClient } from "telegram";
 import {
   successResult,
   errorResult,
@@ -9,6 +9,7 @@ import {
   TOPIC_BINDINGS_DB,
   MIGRATION_JOBS_DB,
   REF_MAP_DB,
+  AUDIT_CHECKPOINTS_DB,
   RESOLVED_ENTITY_CACHE,
   DB_INITIALIZED,
   setDbInitialized,
@@ -29,7 +30,7 @@ export async function handleDbTool(
         { category: "discovery", count: 3, description: "Self-discovery of MCP tools, categories, and server health", examples: ["search_tools", "list_tool_categories", "telegram_health_check"] },
         { category: "contacts", count: 14, description: "Contact management, search, blocking, import/export, and vCards", examples: ["list_contacts", "search_contacts", "add_contact", "block_user"] },
         { category: "chats", count: 27, description: "Dialogs, channels, and forum topic operations & incremental sync", examples: ["list_chats", "list_topics", "create_forum_topic", "find_or_create_topic", "compare_topics"] },
-        { category: "messages", count: 33, description: "Messages, search, copy without forward tag, scheduling, reactions, polls, buttons, drafts", examples: ["send_message", "get_history", "copy_message", "send_reaction", "press_inline_button"] },
+        { category: "messages", count: 34, description: "Messages, search, copy without forward tag, batch caption edit, scheduling, reactions, polls, buttons, drafts", examples: ["send_message", "get_history", "copy_message", "batch_edit_captions", "send_reaction"] },
         { category: "groups", count: 34, description: "Group/supergroup administration, permissions, slow mode, forum controls, and group analytics", examples: ["promote_admin", "ban_user", "close_forum_topic", "delete_topic", "analyze_group"] },
         { category: "media", count: 12, description: "Media upload/download, albums, voice notes, stickers, GIFs, and templated topic publishing", examples: ["send_file", "send_album", "get_media_info", "publish_media_with_template", "validate_topic"] },
         { category: "profile", count: 11, description: "Personal profile, photos, privacy settings, user statuses, and bot commands", examples: ["get_me", "update_profile", "get_full_user", "get_privacy_settings"] },
@@ -37,10 +38,10 @@ export async function handleDbTool(
         { category: "events", count: 2, description: "Real-time incoming message polling and debounced settling", examples: ["wait_for_new_message", "wait_for_settled_message"] },
         { category: "forum_forward", count: 1, description: "Bulk forum topic copying across supergroups without forward tags", examples: ["forward_topics_from_group"] },
         { category: "content", count: 2, description: "Chat content quality analysis, deduplication clustering, and curated migration", examples: ["analyze_chat_content", "curate_content_to_group"] },
-        { category: "database", count: 10, description: "Deduplication tracking, SHA-256 content hashing, series episode auditing, and topic bindings with Cloudflare KV persistence", examples: ["initialize_database", "compute_content_hash_tool", "check_duplicate", "audit_series_sequence", "record_topic_binding"] },
-        { category: "migration", count: 15, description: "Autonomous forum migration, selective topic copy, inactive topic cleanup, and strict episode reordering", examples: ["migrate_topics_autonomous", "migrate_group_comprehensive", "copy_topic_selective", "strict_reorder_topic"] },
+        { category: "database", count: 14, description: "Deduplication tracking, SHA-256 content hashing, audit checkpoints, read-only DB query, parity check, and topic bindings with Cloudflare KV persistence", examples: ["initialize_database", "query_media_db", "db_parity_check", "save_audit_checkpoint", "get_audit_checkpoint"] },
+        { category: "migration", count: 17, description: "Autonomous forum migration, delta topic sync, sequence auditing, selective topic copy, inactive topic cleanup, and strict episode reordering", examples: ["migrate_topics_autonomous", "sync_topic_delta", "audit_topic_sequence", "strict_reorder_topic"] },
       ];
-      return successResult({ total_categories: categories.length, total_tools: 172, categories });
+      return successResult({ total_categories: categories.length, total_tools: 179, categories });
     }
 
     case "search_tools": {
@@ -67,6 +68,7 @@ export async function handleDbTool(
           series_episodes: SERIES_EPISODES_DB.size,
           topic_bindings: TOPIC_BINDINGS_DB.size,
           migration_jobs: MIGRATION_JOBS_DB.size,
+          audit_checkpoints: AUDIT_CHECKPOINTS_DB.size,
           ref_maps: REF_MAP_DB.size,
         },
         entity_cache_size: RESOLVED_ENTITY_CACHE.size,
@@ -79,12 +81,13 @@ export async function handleDbTool(
       return successResult({
         status: "initialized",
         persistence: hasKv ? "Cloudflare KV + In-Memory" : "In-Memory",
-        tables: ["processed_messages", "series_episodes", "topic_bindings", "migration_jobs", "ref_map"],
+        tables: ["processed_messages", "series_episodes", "topic_bindings", "migration_jobs", "audit_checkpoints", "ref_map"],
         counts: {
           processed_messages: PROCESSED_MESSAGES_DB.size,
           series_episodes: SERIES_EPISODES_DB.size,
           topic_bindings: TOPIC_BINDINGS_DB.size,
           migration_jobs: MIGRATION_JOBS_DB.size,
+          audit_checkpoints: AUDIT_CHECKPOINTS_DB.size,
         },
       });
     }
@@ -223,18 +226,26 @@ export async function handleDbTool(
       const normSeries = normalizeForumTitle(args.series_name);
       const chatId = String(args.chat_id || "");
       const topicId = Number(args.topic_id);
+      const existing =
+        TOPIC_BINDINGS_DB.get(`${chatId}::${normSeries}`) ||
+        (await persistKvGet(`topic_binding:${chatId}:${normSeries}`));
+      const lastSyncedMsgId =
+        args.last_synced_msg_id !== undefined
+          ? Number(args.last_synced_msg_id)
+          : Number(existing?.last_synced_msg_id || 0);
+
       const binding = {
         series_name: args.series_name,
         normalized_series_name: normSeries,
         chat_id: chatId,
         topic_id: topicId,
         binding_type: String(args.binding_type || "PRIMARY"),
+        last_synced_msg_id: lastSyncedMsgId,
         updated_at: new Date().toISOString(),
       };
       TOPIC_BINDINGS_DB.set(`${chatId}::${normSeries}`, binding);
       TOPIC_BINDINGS_DB.set(normSeries, binding);
 
-      // Persist to Cloudflare KV
       await persistKvSet(`topic_binding:${chatId}:${normSeries}`, binding);
       await persistKvSet(`topic_binding_global:${normSeries}`, binding);
 
@@ -250,7 +261,6 @@ export async function handleDbTool(
           TOPIC_BINDINGS_DB.get(normSeries) ||
           null;
 
-        // Fallback to Cloudflare KV if not found in memory
         if (!b && chatId) {
           b = await persistKvGet(`topic_binding:${chatId}:${normSeries}`);
           if (b) TOPIC_BINDINGS_DB.set(`${chatId}::${normSeries}`, b);
@@ -287,7 +297,6 @@ export async function handleDbTool(
       existing.updated_at = new Date().toISOString();
       MIGRATION_JOBS_DB.set(jobId, existing);
 
-      // Persist to Cloudflare KV
       await persistKvSet(`migration_job:${jobId}`, existing);
 
       return successResult({ status: "progress_updated", job: existing });
@@ -303,6 +312,118 @@ export async function handleDbTool(
         job_id: jobId,
         total_mappings: entries.length,
         mappings: args.list_all ? entries : entries.slice(0, 100),
+      });
+    }
+
+    case "save_audit_checkpoint": {
+      const sweepName = String(args.sweep_name || "").trim();
+      if (!sweepName) return errorResult("sweep_name is required.");
+      const checkpoint = {
+        sweep_name: sweepName,
+        last_topic_id: args.last_topic_id !== undefined && args.last_topic_id !== null ? Number(args.last_topic_id) : null,
+        processed_count: Number(args.processed_count || 0),
+        status: String(args.status || "IN_PROGRESS"),
+        metadata_json: args.metadata_json ? (typeof args.metadata_json === "string" ? args.metadata_json : JSON.stringify(args.metadata_json)) : null,
+        updated_at: new Date().toISOString(),
+      };
+      AUDIT_CHECKPOINTS_DB.set(sweepName, checkpoint);
+      await persistKvSet(`audit_checkpoint:${sweepName}`, checkpoint);
+      return successResult({ status: "SUCCESS", checkpoint });
+    }
+
+    case "get_audit_checkpoint": {
+      const sweepName = String(args.sweep_name || "").trim();
+      if (!sweepName) return errorResult("sweep_name is required.");
+      let cp = AUDIT_CHECKPOINTS_DB.get(sweepName) || null;
+      if (!cp) {
+        cp = await persistKvGet(`audit_checkpoint:${sweepName}`);
+        if (cp) AUDIT_CHECKPOINTS_DB.set(sweepName, cp);
+      }
+      return successResult({
+        status: "SUCCESS",
+        found: Boolean(cp),
+        checkpoint: cp,
+      });
+    }
+
+    case "query_media_db": {
+      const rawSql = String(args.sql || args.query || "").trim();
+      if (!rawSql) return errorResult("sql is required.");
+
+      // Read-only SQL guard (mirrors Python DB-READONLY-VIOLATION check)
+      const strippedNoStrings = rawSql
+        .replace(/'([^'\\]|\\.)*'/g, "''")
+        .replace(/"([^"\\]|\\.)*"/g, '""');
+      const upper = strippedNoStrings.toUpperCase();
+      const forbidden = /\b(DELETE|DROP|UPDATE|INSERT|ALTER|REPLACE|TRUNCATE|CREATE|ATTACH|DETACH)\b|;/i;
+      if (forbidden.test(upper.replace(/;\s*$/, "")) || (!upper.startsWith("SELECT") && !upper.startsWith("PRAGMA"))) {
+        return successResult({
+          status: "ERROR",
+          error_code: "DB-READONLY-VIOLATION",
+          error: "Only read-only SELECT or PRAGMA queries are allowed.",
+        });
+      }
+
+      const tableMap: Record<string, any[]> = {
+        topic_bindings: Array.from(TOPIC_BINDINGS_DB.values()),
+        audit_checkpoints: Array.from(AUDIT_CHECKPOINTS_DB.values()),
+        migration_jobs: Array.from(MIGRATION_JOBS_DB.values()),
+        processed_messages: Array.from(PROCESSED_MESSAGES_DB.values()),
+        series_episodes: Array.from(SERIES_EPISODES_DB.entries()).map(([k, v]) => ({
+          key: k,
+          series_name: v.series_name,
+          season_number: v.season_number,
+          episode_count: v.episodes?.size || 0,
+        })),
+      };
+
+      const lower = rawSql.toLowerCase();
+      if (lower.includes("sqlite_master")) {
+        return successResult({
+          status: "SUCCESS",
+          rows: Object.keys(tableMap).map((name) => ({ name })),
+        });
+      }
+
+      for (const [tbl, rows] of Object.entries(tableMap)) {
+        if (lower.includes(tbl)) {
+          const limitMatch = lower.match(/\blimit\s+(\d+)/);
+          const limit = limitMatch ? Math.min(Number(limitMatch[1]), 200) : 100;
+          return successResult({
+            status: "SUCCESS",
+            table: tbl,
+            count: Math.min(rows.length, limit),
+            rows: rows.slice(0, limit),
+          });
+        }
+      }
+
+      return successResult({ status: "SUCCESS", rows: [] });
+    }
+
+    case "db_parity_check": {
+      const bindings = Array.from(TOPIC_BINDINGS_DB.values());
+      const jobs = Array.from(MIGRATION_JOBS_DB.values());
+      const checkpoints = Array.from(AUDIT_CHECKPOINTS_DB.values());
+      const chatFilter = args.chat_id ? String(args.chat_id) : null;
+      const filteredBindings = chatFilter
+        ? bindings.filter((b) => String(b.chat_id) === chatFilter)
+        : bindings;
+
+      return successResult({
+        status: "SUCCESS",
+        chat_id: chatFilter,
+        counts: {
+          topic_bindings: filteredBindings.length,
+          processed_messages: PROCESSED_MESSAGES_DB.size,
+          series_episodes: SERIES_EPISODES_DB.size,
+          migration_jobs: jobs.length,
+          audit_checkpoints: checkpoints.length,
+        },
+        bindings_missing_sync_cursor: filteredBindings
+          .filter((b) => !b.last_synced_msg_id || Number(b.last_synced_msg_id) === 0)
+          .slice(0, 50)
+          .map((b) => ({ series_name: b.series_name, topic_id: b.topic_id, chat_id: b.chat_id })),
       });
     }
 

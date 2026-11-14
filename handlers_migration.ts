@@ -12,6 +12,7 @@ import {
   resolveInputChannel,
   formatTelegramError,
   MIGRATION_JOBS_DB,
+  TOPIC_BINDINGS_DB,
   withSmartRetry,
   persistKvSet,
   persistKvGet
@@ -278,6 +279,185 @@ export async function handleMigrationTool(
         messages_copied: copied,
         last_copied_msg_id: lastId,
         remaining: Math.max(0, missing.length - copied),
+      });
+    }
+
+    case "sync_topic_delta": {
+      const srcChat = args.source_chat_id;
+      const srcTopicId = Number(args.source_topic_id);
+      const tgtChat = args.target_chat_id;
+      const tgtTopicId = Number(args.target_topic_id);
+      const seriesName = args.series_name ? String(args.series_name) : null;
+      const dryRun = Boolean(args.dry_run);
+      const limit = Math.min(Math.max(Number(args.limit || 50), 1), 200);
+      const delayMs = Math.max(Number(args.delay ?? 0.5) * 1000, 100);
+      const batchSize = Math.max(Number(args.batch_size ?? 10), 0);
+      const pauseMs = Math.max(Number(args.pause_seconds ?? 3.0) * 1000, 0);
+
+      if (!srcChat || !srcTopicId || !tgtChat || !tgtTopicId) {
+        return errorResult("source_chat_id, source_topic_id, target_chat_id, and target_topic_id are required.");
+      }
+
+      // Resolve last_synced_msg_id from args or stored binding
+      let lastSynced = args.last_synced_msg_id !== undefined ? Number(args.last_synced_msg_id) : 0;
+      const normSeries = seriesName ? normalizeForumTitle(seriesName) : null;
+      if (!lastSynced && normSeries) {
+        const stored =
+          TOPIC_BINDINGS_DB.get(`${String(tgtChat)}::${normSeries}`) ||
+          (await persistKvGet(`topic_binding:${String(tgtChat)}:${normSeries}`));
+        if (stored?.last_synced_msg_id) {
+          lastSynced = Number(stored.last_synced_msg_id);
+        }
+      }
+
+      const srcEntity = await resolveEntity(client, srcChat);
+      const tgtEntity = await resolveEntity(client, tgtChat);
+
+      const srcMsgs = await fetchTopicMessagesChronological(client, srcEntity, srcTopicId, 200);
+      const deltaMsgs = srcMsgs.filter((m) => !isNoiseMessage(m) && Number(m.id) > lastSynced);
+      const toCopy = deltaMsgs.slice(0, limit);
+
+      if (dryRun) {
+        return successResult({
+          status: "DRY_RUN",
+          source_topic_id: srcTopicId,
+          target_topic_id: tgtTopicId,
+          last_synced_msg_id: lastSynced,
+          delta_count: deltaMsgs.length,
+          would_copy: toCopy.map((m) => ({ id: m.id, has_media: Boolean(m.media), preview: String(m.message || "").slice(0, 80) })),
+        });
+      }
+
+      let copied = 0;
+      let newLastSynced = lastSynced;
+
+      for (const msg of toCopy) {
+        if (msg.media) {
+          await withSmartRetry(
+            () =>
+              client.sendFile(tgtEntity, {
+                file: msg.media,
+                caption: msg.message || "",
+                replyTo: tgtTopicId,
+              }),
+            3,
+            10,
+            "sync_topic_delta_media"
+          );
+        } else if (msg.message?.trim()) {
+          await withSmartRetry(
+            () =>
+              client.sendMessage(tgtEntity, {
+                message: msg.message,
+                replyTo: tgtTopicId,
+              }),
+            3,
+            10,
+            "sync_topic_delta_text"
+          );
+        }
+        copied++;
+        newLastSynced = Math.max(newLastSynced, Number(msg.id));
+        await new Promise((r) => setTimeout(r, delayMs));
+        if (batchSize > 0 && copied % batchSize === 0 && pauseMs > 0) {
+          await new Promise((r) => setTimeout(r, pauseMs));
+        }
+      }
+
+      if (normSeries && newLastSynced > lastSynced) {
+        const key = `${String(tgtChat)}::${normSeries}`;
+        const existing = TOPIC_BINDINGS_DB.get(key) || {
+          series_name: seriesName,
+          normalized_series_name: normSeries,
+          chat_id: String(tgtChat),
+          topic_id: tgtTopicId,
+          binding_type: "PRIMARY",
+        };
+        existing.last_synced_msg_id = newLastSynced;
+        existing.updated_at = new Date().toISOString();
+        TOPIC_BINDINGS_DB.set(key, existing);
+        await persistKvSet(`topic_binding:${String(tgtChat)}:${normSeries}`, existing);
+      }
+
+      return successResult({
+        status: "SUCCESS",
+        source_topic_id: srcTopicId,
+        target_topic_id: tgtTopicId,
+        previous_last_synced_msg_id: lastSynced,
+        last_synced_msg_id: newLastSynced,
+        delta_detected: deltaMsgs.length,
+        messages_copied: copied,
+        remaining: Math.max(0, deltaMsgs.length - copied),
+      });
+    }
+
+    case "audit_topic_sequence": {
+      const peer = args.chat_id || args.peer;
+      const topicId = Number(args.topic_id);
+      if (!peer || !topicId) return errorResult("chat_id and topic_id are required.");
+
+      const entity = await resolveEntity(client, peer);
+      const msgs = await fetchTopicMessagesChronological(
+        client,
+        entity,
+        topicId,
+        Number(args.limit || 200)
+      );
+
+      const validMsgs = msgs.filter((m) => !isNoiseMessage(m));
+      const episodeList: Array<{ msg_id: number; season: number; episode: number }> = [];
+      const seen = new Map<string, number[]>();
+      const duplicates: Array<{ key: string; msg_ids: number[] }> = [];
+
+      for (const m of validMsgs) {
+        const ep = extractEpisodeInfo(m.message || "");
+        if (ep) {
+          episodeList.push({ msg_id: Number(m.id), season: ep.season, episode: ep.episode });
+          const k = `S${ep.season}E${ep.episode}`;
+          if (!seen.has(k)) seen.set(k, []);
+          seen.get(k)!.push(Number(m.id));
+        }
+      }
+
+      for (const [k, ids] of seen.entries()) {
+        if (ids.length > 1) duplicates.push({ key: k, msg_ids: ids });
+      }
+
+      let isAscending = true;
+      let isReversed = episodeList.length > 1;
+      for (let i = 1; i < episodeList.length; i++) {
+        const prev = episodeList[i - 1].season * 1000 + episodeList[i - 1].episode;
+        const curr = episodeList[i].season * 1000 + episodeList[i].episode;
+        if (curr < prev) isAscending = false;
+        if (curr > prev) isReversed = false;
+      }
+
+      const season1Eps = episodeList.filter((e) => e.season === 1).map((e) => e.episode);
+      const maxEp = season1Eps.length ? Math.max(...season1Eps) : 0;
+      const epSet = new Set(season1Eps);
+      const missing: number[] = [];
+      for (let i = 1; i <= maxEp; i++) {
+        if (!epSet.has(i)) missing.push(i);
+      }
+
+      let classification = "ASCENDING";
+      if (episodeList.length === 0) classification = "NO_EPISODES_DETECTED";
+      else if (isReversed) classification = "REVERSED";
+      else if (duplicates.length > 0 && missing.length > 0) classification = "DUPLICATES_AND_GAPS";
+      else if (duplicates.length > 0) classification = "DUPLICATES";
+      else if (missing.length > 0) classification = "GAPS";
+      else if (!isAscending) classification = "OUT_OF_ORDER";
+
+      return successResult({
+        status: "SUCCESS",
+        chat_id: peer,
+        topic_id: topicId,
+        total_scanned: msgs.length,
+        valid_messages: validMsgs.length,
+        episodes_detected: episodeList.length,
+        classification,
+        missing_episodes: missing,
+        duplicates,
       });
     }
 
@@ -833,7 +1013,6 @@ export async function handleMigrationTool(
       const tgtChat = args.target_chat_id || args.to_chat_id;
       if (!srcChat || !tgtChat) return errorResult("source_chat_id and target_chat_id are required.");
 
-      // New Batching and Cursor Pagination parameters
       const limit = Math.min(Math.max(Number(args.limit || 50), 1), 200);
       const offset = Math.max(Number(args.offset || 0), 0);
       const summaryOnly = Boolean(args.summary_only);
